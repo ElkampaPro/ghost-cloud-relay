@@ -122,6 +122,7 @@ function parseIncomingMessage(data) {
         html: msgHtml || msgText,
         time: timeNow,
         timestamp: Date.now(),
+        type: 'received',
         synced: false
     };
 }
@@ -206,9 +207,8 @@ function initChatSocket() {
                 const exists = messages.some(m => m.id === parsed.id);
                 if (!exists) {
                     messages.push(parsed);
-                    // Keep max 500 messages
-                    if (messages.length > 500) {
-                        messages = messages.slice(-500);
+                    if (messages.length > 1000) {
+                        messages = messages.slice(-1000);
                     }
                     saveJson(MESSAGES_FILE, messages);
                     console.log(`[Ghost Cloud] Captured message from ${parsed.name} (${parsed.peerId}): ${parsed.text.substring(0, 40)}`);
@@ -238,58 +238,298 @@ function requireAuth(req, res, next) {
     next();
 }
 
-// 1. Web Dashboard (Home)
+// 1. Web Dashboard & Mobile Web Chat App (Home)
 app.get('/', (req, res) => {
-    const unsynced = messages.filter(m => !m.synced).length;
     res.send(`<!DOCTYPE html>
 <html dir="rtl" lang="ar">
 <head>
     <meta charset="UTF-8">
-    <title>Ghost Cloud Relay Server 👻</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>شبح الخاص | Ghost Cloud Chat 👻</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background: #011c23; color: #fff; margin: 0; padding: 40px 20px; direction: rtl; }
-        .card { max-width: 650px; margin: 0 auto; background: #022b35; border: 1px solid #00bcd4; border-radius: 12px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        h1 { color: #00bcd4; margin-top: 0; font-size: 24px; display: flex; align-items: center; gap: 10px; }
-        .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; }
-        .badge.online { background: #22c55e; color: #fff; }
-        .badge.offline { background: #ef4444; color: #fff; }
-        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 25px 0; }
-        .stat-box { background: rgba(0,0,0,0.25); border-radius: 8px; padding: 15px; border-right: 4px solid #00bcd4; }
-        .stat-val { font-size: 24px; font-weight: bold; color: #00e5ff; margin-top: 5px; }
-        .stat-label { font-size: 13px; color: #94a3b8; }
-        code { background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 4px; font-family: monospace; color: #f59e0b; direction: ltr; display: inline-block; }
-        .footer { margin-top: 25px; font-size: 12px; color: #64748b; text-align: center; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px; }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #011c23; color: #fff; height: 100vh; display: flex; flex-direction: column; overflow: hidden; direction: rtl; }
+        
+        /* Login Overlay */
+        #login_overlay { position: fixed; inset: 0; background: #011c23; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .login_card { background: #022b35; border: 1px solid #00bcd4; border-radius: 14px; padding: 30px 24px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
+        .login_card h2 { color: #00bcd4; margin-bottom: 8px; font-size: 22px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .login_card p { color: #94a3b8; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+        .login_input { width: 100%; padding: 12px 14px; border-radius: 8px; border: 1px solid #00bcd4; background: rgba(0,0,0,0.3); color: #fff; font-size: 14px; direction: ltr; text-align: center; margin-bottom: 16px; outline: none; }
+        .login_btn { width: 100%; padding: 12px; background: #00bcd4; color: #012832; border: none; border-radius: 8px; font-weight: bold; font-size: 15px; cursor: pointer; transition: 0.2s; }
+        .login_btn:hover { background: #00e5ff; }
+
+        /* Main App Header */
+        header { height: 50px; background: rgb(1, 40, 50); border-bottom: 1px solid #00bcd4; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; flex-shrink: 0; }
+        .header_title { font-size: 16px; font-weight: bold; color: #00bcd4; display: flex; align-items: center; gap: 8px; }
+        .badge_status { font-size: 11px; padding: 3px 8px; border-radius: 12px; background: #10b981; color: #fff; font-weight: bold; }
+        .badge_status.offline { background: #ef4444; }
+        .header_actions { display: flex; align-items: center; gap: 12px; }
+        .header_btn { background: none; border: none; color: #94a3b8; font-size: 16px; cursor: pointer; }
+        .header_btn:hover { color: #fff; }
+
+        /* App Container */
+        #app_container { flex: 1; display: flex; overflow: hidden; position: relative; }
+        
+        /* Contacts Sidebar / Pane */
+        #contacts_pane { width: 340px; background: #02232b; border-left: 1px solid rgba(0,188,212,0.2); display: flex; flex-direction: column; flex-shrink: 0; }
+        .search_bar { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+        .search_input { width: 100%; padding: 8px 12px; border-radius: 20px; border: 1px solid rgba(0,188,212,0.3); background: rgba(0,0,0,0.25); color: #fff; font-size: 13px; outline: none; }
+        #contacts_list { flex: 1; overflow-y: auto; list-style: none; }
+        .contact_item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer; transition: background 0.15s; }
+        .contact_item:hover, .contact_item.active { background: rgba(0, 188, 212, 0.12); }
+        .contact_avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; border: 1.5px solid #00bcd4; flex-shrink: 0; }
+        .contact_info { flex: 1; min-width: 0; }
+        .contact_header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+        .contact_name { font-size: 14px; font-weight: bold; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .contact_time { font-size: 11px; color: #94a3b8; }
+        .contact_snippet { font-size: 12px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+        /* Chat Messages Pane */
+        #chat_pane { flex: 1; display: flex; flex-direction: column; background: #01181e; position: relative; }
+        #chat_top { height: 50px; background: rgba(1, 40, 50, 0.95); border-bottom: 1px solid rgba(0,188,212,0.2); display: flex; align-items: center; justify-content: space-between; padding: 0 16px; }
+        .chat_target_info { display: flex; align-items: center; gap: 10px; }
+        .back_btn { display: none; background: none; border: none; color: #00bcd4; font-size: 18px; cursor: pointer; margin-left: 8px; }
+        
+        #messages_area { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+        
+        /* Message Bubbles matching Arabic Chat exact colors */
+        .msg_row { display: flex; align-items: flex-end; gap: 8px; max-width: 82%; }
+        .msg_row.received { align-self: flex-start; }
+        .msg_row.sent { align-self: flex-end; flex-direction: row-reverse; }
+        .msg_bubble { padding: 8px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.45; word-break: break-word; }
+        .msg_row.received .msg_bubble { background: rgb(51, 51, 51); color: #fff; border-radius: 6px 0 6px 6px; }
+        .msg_row.sent .msg_bubble { background: rgb(0, 188, 212); color: #012832; font-weight: 500; border-radius: 0 6px 6px 6px; }
+        .msg_meta { font-size: 10px; opacity: 0.7; margin-top: 4px; text-align: left; }
+        .msg_row.received .msg_meta { text-align: right; }
+        
+        /* Audio and Media */
+        audio { height: 34px; max-width: 220px; outline: none; margin-top: 4px; }
+        .msg_bubble img { max-width: 100%; max-height: 240px; border-radius: 6px; cursor: pointer; }
+
+        /* Empty placeholder */
+        .empty_view { margin: auto; text-align: center; color: #64748b; padding: 30px; }
+        .empty_view i { font-size: 44px; color: #00bcd4; margin-bottom: 12px; display: block; opacity: 0.6; }
+
+        /* Responsive Breakpoints for Mobile Phones */
+        @media (max-width: 768px) {
+            #contacts_pane { width: 100%; position: absolute; inset: 0; z-index: 10; }
+            #chat_pane { width: 100%; position: absolute; inset: 0; display: none; z-index: 20; }
+            .back_btn { display: inline-block; }
+            #app_container.in_chat #contacts_pane { display: none; }
+            #app_container.in_chat #chat_pane { display: flex; }
+        }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h1>👻 خادم شبح السحابي (Ghost Cloud Relay)</h1>
-        <p>الخادم يعمل بنجاح 24/7 لالتقاط رسائل الخاص بصمت وتمريرها لإضافة المتصفح (Zero-Seen).</p>
-        
-        <div class="stat-grid">
-            <div class="stat-box">
-                <div class="stat-label">حالة الاتصال بموقع الشات</div>
-                <div class="stat-val">
-                    <span class="badge ${socketConnected ? 'online' : 'offline'}">${socketConnected ? '🟢 متصل بالسوكت' : '🔴 غير متصل'}</span>
-                </div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-label">رسائل بانتظار المزامنة</div>
-                <div class="stat-val">${unsynced} / ${messages.length}</div>
-            </div>
-        </div>
 
-        <div style="background:rgba(0,0,0,0.2); padding:15px; border-radius:8px; font-size:14px; line-height:1.7;">
-            <div><strong>🔑 المفتاح السري:</strong> محمي بواسطة <code>GHOST_SECRET</code></div>
-            <div><strong>🍪 حالة كوكيز الجلسة:</strong> ${sessionData.cookies ? '✔️ مسجلة ومحدثة' : '⚠️ بانتظار المزامنة الأولى من الإضافة'}</div>
-            <div><strong>🕒 آخر اتصال:</strong> ${lastConnectedTime ? new Date(lastConnectedTime).toLocaleTimeString('ar-EG') : 'لم يتصل بعد'}</div>
-            ${lastError ? `<div style="color:#f87171;"><strong>⚠️ آخر خطأ:</strong> ${lastError}</div>` : ''}
-        </div>
-
-        <div class="footer">
-            جاهز للمزامنة مع إضافة المتصفح Arabic Chat Ghost Extension
+    <!-- Login Overlay -->
+    <div id="login_overlay">
+        <div class="login_card">
+            <h2><i class="fa fa-ghost"></i> شبح الخاص السحابي</h2>
+            <p>أدخل المفتاح السري (Secret Key) لفتح ومزامنة محادثات الشات الخاصة بك مباشرة على هاتفك.</p>
+            <input type="password" id="secret_input" class="login_input" placeholder="أدخل المفتاح السري هنا...">
+            <button id="login_btn" class="login_btn"><i class="fa fa-unlock-alt"></i> تسجيل الدخول والمزامنة</button>
         </div>
     </div>
+
+    <!-- Main App Header -->
+    <header>
+        <div class="header_title">
+            <span>👻 شبح الخاص (Ghost Web Viewer)</span>
+            <span id="socket_badge" class="badge_status ${socketConnected ? '' : 'offline'}">${socketConnected ? '🟢 متصل بالسيرفر' : '🟡 يعمل بالسحابة'}</span>
+        </div>
+        <div class="header_actions">
+            <button id="refresh_btn" class="header_btn" title="تحديث فوري"><i class="fa fa-sync-alt"></i></button>
+            <button id="logout_btn" class="header_btn" title="تسجيل الخروج"><i class="fa fa-sign-out-alt"></i></button>
+        </div>
+    </header>
+
+    <!-- App Container -->
+    <div id="app_container">
+        <!-- Contacts List Pane -->
+        <div id="contacts_pane">
+            <div class="search_bar">
+                <input type="text" id="search_input" class="search_input" placeholder="🔍 بحث في جهات الاتصال...">
+            </div>
+            <ul id="contacts_list">
+                <div class="empty_view"><i class="fa fa-spinner fa-spin"></i>جاري جلب المحادثات...</div>
+            </ul>
+        </div>
+
+        <!-- Messages Pane -->
+        <div id="chat_pane">
+            <div id="chat_top">
+                <div class="chat_target_info">
+                    <button id="back_btn" class="back_btn"><i class="fa fa-arrow-right"></i></button>
+                    <img id="active_avatar" class="contact_avatar" src="https://www.arabic.chat/default_images/avatar/default_avatar.png">
+                    <div>
+                        <div id="active_name" style="font-weight:bold; font-size:14px;">مستخدم</div>
+                        <div style="font-size:11px; color:#00bcd4;">محادثة متزامنة مع الكمبيوتر</div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="messages_area">
+                <div class="empty_view">
+                    <i class="fa fa-comments"></i>
+                    اختر محادثة من القائمة لعرض الرسائل المتبادلة
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let SECRET_KEY = localStorage.getItem('ghost_secret_key') || '';
+        let conversations = [];
+        let activePeerId = null;
+
+        const loginOverlay = document.getElementById('login_overlay');
+        const secretInput = document.getElementById('secret_input');
+        const loginBtn = document.getElementById('login_btn');
+        const appContainer = document.getElementById('app_container');
+        const contactsList = document.getElementById('contacts_list');
+        const searchInput = document.getElementById('search_input');
+        const messagesArea = document.getElementById('messages_area');
+        const backBtn = document.getElementById('back_btn');
+        const activeName = document.getElementById('active_name');
+        const activeAvatar = document.getElementById('active_avatar');
+        const refreshBtn = document.getElementById('refresh_btn');
+        const logoutBtn = document.getElementById('logout_btn');
+
+        if (SECRET_KEY) {
+            loginOverlay.style.display = 'none';
+            initApp();
+        }
+
+        loginBtn.onclick = function () {
+            const key = secretInput.value.trim();
+            if (!key) return alert("يرجى كتابة المفتاح السري");
+            SECRET_KEY = key;
+            localStorage.setItem('ghost_secret_key', key);
+            loginOverlay.style.display = 'none';
+            initApp();
+        };
+
+        logoutBtn.onclick = function () {
+            if (confirm("تسجيل الخروج من لوحة الشبح؟")) {
+                localStorage.removeItem('ghost_secret_key');
+                location.reload();
+            }
+        };
+
+        backBtn.onclick = function () {
+            appContainer.classList.remove('in_chat');
+            activePeerId = null;
+        };
+
+        refreshBtn.onclick = function () {
+            fetchConversations();
+        };
+
+        function initApp() {
+            fetchConversations();
+            setInterval(fetchConversations, 3500);
+        }
+
+        function fetchConversations() {
+            if (!SECRET_KEY) return;
+            fetch('/api/conversations?key=' + encodeURIComponent(SECRET_KEY))
+                .then(r => {
+                    if (r.status === 401) {
+                        localStorage.removeItem('ghost_secret_key');
+                        loginOverlay.style.display = 'flex';
+                        throw new Error("Invalid Secret");
+                    }
+                    return r.json();
+                })
+                .then(res => {
+                    if (res && res.ok) {
+                        conversations = res.conversations || [];
+                        renderContactsList();
+                        if (activePeerId) {
+                            renderActiveMessages();
+                        }
+                    }
+                })
+                .catch(err => {
+                    console.warn("Sync error:", err);
+                });
+        }
+
+        function renderContactsList() {
+            const q = (searchInput.value || '').trim().toLowerCase();
+            const filtered = conversations.filter(c => !q || (c.name && c.name.toLowerCase().includes(q)) || c.peerId.includes(q));
+
+            if (filtered.length === 0) {
+                contactsList.innerHTML = '<div class="empty_view"><i class="fa fa-inbox"></i>لا توجد محادثات مسجلة بعد</div>';
+                return;
+            }
+
+            contactsList.innerHTML = filtered.map(c => {
+                const isActive = c.peerId === activePeerId;
+                const avatar = c.avatar.startsWith('http') ? c.avatar : ('https://www.arabic.chat/' + c.avatar.replace(/^\\/+/, ''));
+                return \`
+                    <li class="contact_item \${isActive ? 'active' : ''}" onclick="openChat('\${c.peerId}')">
+                        <img class="contact_avatar" src="\${avatar}" onerror="this.src='https://www.arabic.chat/default_images/avatar/default_avatar.png'">
+                        <div class="contact_info">
+                            <div class="contact_header">
+                                <span class="contact_name">\${c.name}</span>
+                                <span class="contact_time">\${c.lastTime || ''}</span>
+                            </div>
+                            <div class="contact_snippet">\${c.lastText || 'رسالة خاصة'}</div>
+                        </div>
+                    </li>
+                \`;
+            }).join('');
+        }
+
+        window.openChat = function (peerId) {
+            activePeerId = peerId;
+            appContainer.classList.add('in_chat');
+            const target = conversations.find(c => c.peerId === peerId);
+            if (target) {
+                activeName.textContent = target.name || ('مستخدم ' + peerId);
+                activeAvatar.src = target.avatar.startsWith('http') ? target.avatar : ('https://www.arabic.chat/' + target.avatar.replace(/^\\/+/, ''));
+            }
+            renderContactsList();
+            renderActiveMessages(true);
+        };
+
+        function renderActiveMessages(scrollBottom = false) {
+            if (!activePeerId) return;
+            const target = conversations.find(c => c.peerId === activePeerId);
+            if (!target || !target.messages || target.messages.length === 0) {
+                messagesArea.innerHTML = '<div class="empty_view"><i class="fa fa-comment-slash"></i>لا توجد رسائل سابقة في هذه المحادثة</div>';
+                return;
+            }
+
+            messagesArea.innerHTML = target.messages.map(m => {
+                const isSent = m.type === 'sent';
+                let content = m.html || m.text || '';
+                // Fix relative images or audio URLs
+                content = content.replace(/src="(?!(https?:|blob:|data:))\\/?([^"]+)"/g, 'src="https://www.arabic.chat/$2"');
+
+                return \`
+                    <div class="msg_row \${isSent ? 'sent' : 'received'}">
+                        <div class="msg_bubble">
+                            \${content}
+                            <div class="msg_meta">\${m.time || ''} \${isSent ? '✓✓' : ''}</div>
+                        </div>
+                    </div>
+                \`;
+            }).join('');
+
+            if (scrollBottom) {
+                messagesArea.scrollTop = messagesArea.scrollHeight;
+            }
+        }
+
+        searchInput.oninput = function () {
+            renderContactsList();
+        };
+    </script>
 </body>
 </html>`);
 });
@@ -309,7 +549,7 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// 3. Sync Messages (Called by Chrome Extension)
+// 3. Sync Messages (Called by Chrome Extension for new incoming/outgoing)
 app.get('/api/sync', requireAuth, (req, res) => {
     const markAsSynced = req.query.mark !== 'false';
     const getAll = req.query.all === 'true';
@@ -340,7 +580,71 @@ app.get('/api/sync', requireAuth, (req, res) => {
     });
 });
 
-// 4. Update Session / Cookies (Called automatically by Extension on page visit)
+// 4. Record Sent Message from PC (Two-Way Sync)
+app.post('/api/messages/sent', requireAuth, (req, res) => {
+    const { peerId, name, message } = req.body;
+    if (!peerId || !message) {
+        return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
+    }
+
+    const sentItem = {
+        id: message.id || ('msg_sent_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
+        peerId: String(peerId),
+        name: name || ('مستخدم ' + peerId),
+        avatar: message.avatar || 'default_images/avatar/default_avatar.png',
+        text: message.text || stripHtml(message.html || ''),
+        html: message.html || message.text || '',
+        time: message.time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        timestamp: message.timestamp || Date.now(),
+        type: 'sent',
+        synced: true
+    };
+
+    const exists = messages.some(m => m.id === sentItem.id);
+    if (!exists) {
+        messages.push(sentItem);
+        if (messages.length > 1000) {
+            messages = messages.slice(-1000);
+        }
+        saveJson(MESSAGES_FILE, messages);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message to ${sentItem.name} (${sentItem.peerId})`);
+    }
+
+    res.json({ ok: true, data: sentItem });
+});
+
+// 5. Get Full Conversations (For Mobile Web Viewer)
+app.get('/api/conversations', requireAuth, (req, res) => {
+    const map = {};
+    messages.forEach(m => {
+        if (!map[m.peerId]) {
+            map[m.peerId] = {
+                peerId: m.peerId,
+                name: m.name || ('مستخدم ' + m.peerId),
+                avatar: m.avatar || 'default_images/avatar/default_avatar.png',
+                lastTime: m.time,
+                lastTimestamp: m.timestamp,
+                lastText: m.text,
+                messages: []
+            };
+        }
+        if (m.name && m.name !== ('مستخدم ' + m.peerId)) {
+            map[m.peerId].name = m.name;
+        }
+        if (m.avatar && m.avatar !== 'default_images/avatar/default_avatar.png') {
+            map[m.peerId].avatar = m.avatar;
+        }
+        map[m.peerId].lastTime = m.time;
+        map[m.peerId].lastTimestamp = m.timestamp;
+        map[m.peerId].lastText = m.text;
+        map[m.peerId].messages.push(m);
+    });
+
+    const convs = Object.values(map).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
+    res.json({ ok: true, count: convs.length, conversations: convs });
+});
+
+// 6. Update Session / Cookies (Called automatically by Extension on page visit)
 app.post('/api/session', requireAuth, (req, res) => {
     const { cookies, utk, userAgent } = req.body;
     let changed = false;
@@ -371,7 +675,7 @@ app.post('/api/session', requireAuth, (req, res) => {
     });
 });
 
-// 5. Test Message Injector (For debugging and manual verification)
+// 7. Test Message Injector (For debugging and manual verification)
 app.post('/api/test-msg', requireAuth, (req, res) => {
     const { peer, name, message } = req.body;
     const testPeer = String(peer || '9999');
@@ -387,6 +691,7 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
         html: `<div class="target_private">${testText}</div>`,
         time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         timestamp: Date.now(),
+        type: 'received',
         synced: false
     };
 
@@ -400,7 +705,7 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
     });
 });
 
-// 6. Clear Messages API
+// 8. Clear Messages API
 app.post('/api/clear', requireAuth, (req, res) => {
     messages = [];
     saveJson(MESSAGES_FILE, messages);

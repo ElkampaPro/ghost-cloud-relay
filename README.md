@@ -1,5 +1,9 @@
 # 👻 Ghost Cloud Relay Server (خادم شبح السحابي 24/7)
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ElkampaPro/ghost-cloud-relay)
+&nbsp;
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/ElkampaPro/ghost-cloud-relay&branch=main&name=ghost-cloud-relay)
+
 خادم سحابي مستقل وخفيف جداً، يعمل على مدار الساعة لالتقاط كافة الرسائل الخاصة الواردة لحسابك على موقع `arabic.chat` وحفظها في بيئة آمنة، ثم مزامنتها تلقائياً مع **إضافة المتصفح (صندوق الشبح)** بمجرد فتح الشات بدون وسم الرسائل كمقروءة (Zero-Seen 100%).
 
 ---

@@ -680,10 +680,10 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// 3. Sync Messages (Called by Chrome Extension for new incoming/outgoing)
+// 3. Sync Messages (Multi-Device Safe: PC, Kiwi Mobile, PWA)
 app.get('/api/sync', requireAuth, (req, res) => {
-    const markAsSynced = req.query.mark !== 'false';
-    const getAll = req.query.all === 'true';
+    const markAsSynced = req.query.mark === 'true'; // Only mark if explicitly asked
+    const getAll = req.query.all !== 'false'; // Default to TRUE so all devices get full sync
     const since = parseInt(req.query.since || '0', 10);
 
     let resultMsgs = [];

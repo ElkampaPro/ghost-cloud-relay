@@ -61,11 +61,18 @@ function saveJson(file, data) {
 
 let messages = loadJson(MESSAGES_FILE, []);
 let sessionData = loadJson(SESSION_FILE, {
-    cookies: '',
-    utk: '',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    cookies: process.env.GHOST_COOKIES || '',
+    utk: process.env.GHOST_UTK || '',
+    userAgent: process.env.GHOST_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     lastUpdated: null
 });
+
+if (!sessionData.cookies && process.env.GHOST_COOKIES) {
+    sessionData.cookies = process.env.GHOST_COOKIES;
+}
+if (!sessionData.utk && process.env.GHOST_UTK) {
+    sessionData.utk = process.env.GHOST_UTK;
+}
 
 let chatSocket = null;
 let socketConnected = false;

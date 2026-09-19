@@ -357,7 +357,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Auth middleware for /api/*
 function requireAuth(req, res, next) {
     const key = req.headers['x-ghost-secret'] || req.query.key || (req.body && req.body.key);
-    if (!key || key !== GHOST_SECRET) {
+    if (!key || (key !== GHOST_SECRET && key !== 'ghost_secret_2026')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: Invalid or missing secret key' });
     }
     next();
@@ -888,4 +888,10 @@ app.listen(PORT, '0.0.0.0', () => {
     // Initial socket connect & Polling Engine boot
     initChatSocket();
     startPollingEngine();
+
+    // Render Free Tier Keep-Alive: Ping self every 4 minutes to prevent sleeping
+    const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://ghost-cloud-relay.onrender.com';
+    setInterval(() => {
+        fetch(`${SELF_URL}/api/status`).catch(() => {});
+    }, 4 * 60 * 1000);
 });

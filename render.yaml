@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ghost-cloud-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: GHOST_SECRET
+        value: ghost_secret_2026
+      - key: SITE_URL
+        value: https://www.arabic.chat
+      - key: SOCKET_PATH
+        value: /io/

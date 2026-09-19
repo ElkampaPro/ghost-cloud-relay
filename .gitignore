@@ -1,0 +1,4 @@
+node_modules/
+service.log
+data/session.json
+.env

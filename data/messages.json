@@ -1,0 +1,24 @@
+[
+  {
+    "id": "msg_test_1789818057767",
+    "peerId": "12345",
+    "name": "سارة",
+    "avatar": "default_images/avatar/default_avatar.png",
+    "text": "مرحباً! هذه رسالة تجريبية عبر السحابة",
+    "html": "<div class=\"target_private\">مرحباً! هذه رسالة تجريبية عبر السحابة</div>",
+    "time": "١٢:٤٠ م",
+    "timestamp": 1789818057856,
+    "synced": true
+  },
+  {
+    "id": "msg_test_1789818890231",
+    "peerId": "8888",
+    "name": "شبح تجريبي",
+    "avatar": "default_images/avatar/default_avatar.png",
+    "text": "أهلاً بك! خادم الشبح يعمل محلياً في الخلفية 100%",
+    "html": "<div class=\"target_private\">أهلاً بك! خادم الشبح يعمل محلياً في الخلفية 100%</div>",
+    "time": "١٢:٥٤ م",
+    "timestamp": 1789818890253,
+    "synced": true
+  }
+]

@@ -28,6 +28,16 @@ if (!fs.existsSync(DATA_DIR)) {
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 const SESSION_FILE = path.join(DATA_DIR, 'session.json');
 
+// In-Memory Ring Buffer for Logs
+const serverLogs = [];
+function addLog(msg) {
+    const timestamp = new Date().toISOString().substring(11, 19);
+    const line = `[${timestamp}] ${msg}`;
+    console.log(line);
+    serverLogs.push(line);
+    if (serverLogs.length > 250) serverLogs.shift();
+}
+
 // Helper to load/save JSON
 function loadJson(file, defVal) {
     try {
@@ -157,10 +167,10 @@ function initChatSocket() {
     try {
         chatSocket = io(SITE_URL, {
             path: SOCKET_PATH,
-            transports: ['websocket', 'polling'],
+            transports: ['websocket'],
             extraHeaders: headers,
             reconnection: true,
-            reconnectionDelay: 3000,
+            reconnectionDelay: 2000,
             reconnectionDelayMax: 30000,
             autoConnect: true,
             timeout: 20000
@@ -170,36 +180,45 @@ function initChatSocket() {
             socketConnected = true;
             lastConnectedTime = new Date().toISOString();
             lastError = null;
-            console.log(`[Socket] Connected successfully! Socket ID: ${chatSocket.id}`);
+            addLog(`[Socket] Connected successfully! Socket ID: ${chatSocket.id}`);
+            try {
+                chatSocket.emit('switch-room');
+            } catch (e) {}
         });
 
         chatSocket.on('disconnect', (reason) => {
             socketConnected = false;
-            console.log(`[Socket] Disconnected. Reason: ${reason}`);
+            addLog(`[Socket] Disconnected. Reason: ${reason}`);
         });
 
         chatSocket.on('connect_error', (err) => {
             socketConnected = false;
             lastError = err ? err.message : 'Unknown connect error';
-            console.warn(`[Socket] Connection error: ${lastError}`);
+            addLog(`[Socket] Connection error: ${lastError}`);
         });
 
         chatSocket.on('error', (err) => {
-            console.warn('[Socket] Generic socket error:', err);
+            addLog(`[Socket] Generic socket error: ${err}`);
         });
 
         if (chatSocket.io) {
             chatSocket.io.on('error', (err) => {
-                console.warn('[Socket Manager] Engine error:', err);
+                addLog(`[Socket Manager] Engine error: ${err}`);
             });
             chatSocket.io.on('reconnect_error', (err) => {
-                console.warn('[Socket Manager] Reconnect error:', err);
+                addLog(`[Socket Manager] Reconnect error: ${err}`);
             });
         }
 
+        chatSocket.onAny((event, ...args) => {
+            if (event !== 'ping' && event !== 'pong') {
+                addLog(`[Socket Event] ${event}: ${JSON.stringify(args).substring(0, 120)}`);
+            }
+        });
+
         chatSocket.on('private-msg', (data) => {
             try {
-                console.log('[Socket] Incoming private-msg received!');
+                addLog('[Socket] Incoming private-msg received!');
                 const parsed = parseIncomingMessage(data);
                 if (!parsed) return;
 
@@ -211,7 +230,7 @@ function initChatSocket() {
                         messages = messages.slice(-1000);
                     }
                     saveJson(MESSAGES_FILE, messages);
-                    console.log(`[Ghost Cloud] Captured message from ${parsed.name} (${parsed.peerId}): ${parsed.text.substring(0, 40)}`);
+                    addLog(`[Ghost Cloud] Captured message from ${parsed.name} (${parsed.peerId}): ${parsed.text.substring(0, 40)}`);
                 }
             } catch (err) {
                 console.error('[Socket] Error processing private-msg:', err);
@@ -220,7 +239,7 @@ function initChatSocket() {
 
     } catch (e) {
         lastError = e.message;
-        console.error('[Socket] Exception initializing socket:', e);
+        addLog(`[Socket] Exception initializing socket: ${e.message}`);
     }
 }
 
@@ -265,6 +284,18 @@ async function pollArabicChatOnce() {
             headers: headers,
             body: bodyData
         });
+
+        // 1.1 Zero-Seen Keep-Alive Heartbeat (priv=0 ensures no message is marked read)
+        // Keeps user online in database so chat-gateway continues dispatching private-msg to the socket
+        if (sessionData.utk) {
+            try {
+                fetch(`${SITE_URL}/system/chat_log.php`, {
+                    method: 'POST',
+                    headers: headers,
+                    body: `fload=0&caction=0&taction=0&last=0&snum=0&preload=0&priv=0&lastp=0&pcount=0&room=1&notify=0&token=${encodeURIComponent(sessionData.utk)}&r=${Date.now()}`
+                }).catch(() => {});
+            } catch (err) {}
+        }
 
         if (!notifyRes.ok) {
             lastPollStats.status = `HTTP_${notifyRes.status}`;
@@ -677,6 +708,15 @@ app.get('/api/status', (req, res) => {
         lastPollCycles: lastPollStats.totalCycles,
         totalMessages: messages.length,
         unsyncedCount: messages.filter(m => !m.synced).length
+    });
+});
+
+// 2.1 Live Logs API (For inspection & forensics)
+app.get('/api/logs', requireAuth, (req, res) => {
+    res.json({
+        ok: true,
+        count: serverLogs.length,
+        logs: serverLogs
     });
 });
 

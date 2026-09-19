@@ -311,81 +311,27 @@ async function pollArabicChatOnce() {
             peersToCheck.set(peerId, { peerId, name, avatar, unreadCount });
         }
 
-        let newMessagesCaptured = 0;
-
+        // 2. Parse contacts from notifyHtml (Read-only, Zero-Seen compliant)
+        // Strictly NEVER fetch system/private_box.php here: private_box.php updates seen=1 on the server!
         for (const [peerId, info] of peersToCheck.entries()) {
-            const hasExisting = messages.some(m => m.peerId === peerId);
-            if (info.unreadCount > 0 || !hasExisting) {
-                try {
-                    const boxBody = `target=${encodeURIComponent(peerId)}&token=${encodeURIComponent(sessionData.utk || '')}`;
-                    const boxRes = await fetch(`${SITE_URL}/system/private_box.php`, {
-                        method: 'POST',
-                        headers: headers,
-                        body: boxBody
-                    });
+            // Update names and avatars for existing stored messages if improved info was parsed
+            messages.forEach(m => {
+                if (m.peerId === peerId) {
+                    if (info.name && m.name === ('مستخدم ' + peerId)) m.name = info.name;
+                    if (info.avatar && m.avatar === 'default_images/avatar/default_avatar.png') m.avatar = info.avatar;
+                }
+            });
 
-                    if (boxRes.ok) {
-                        const boxData = await boxRes.json();
-                        if (boxData && boxData.priv_logs && boxData.priv_logs != 99) {
-                            const logsHtml = String(boxData.priv_logs);
-                            const liItems = logsHtml.split(/(?=<li[^>]*class="[^"]*prlog)/i);
-
-                            for (const liHtml of liItems) {
-                                if (!liHtml.includes('prlog')) continue;
-                                const idMatch = liHtml.match(/data-id="([^"]+)"/i);
-                                const msgId = idMatch ? idMatch[1] : ('polled_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
-
-                                const isTarget = /class="[^"]*target_private[^"]*"/i.test(liHtml);
-                                const isHunter = /class="[^"]*hunter_private[^"]*"/i.test(liHtml);
-                                const type = isTarget ? 'received' : 'sent';
-
-                                let text = '';
-                                let html = '';
-                                const contentMatch = liHtml.match(/class="[^"]*(?:target_private|hunter_private)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-                                if (contentMatch && contentMatch[1]) {
-                                    html = contentMatch[1].trim();
-                                    text = stripHtml(html);
-                                }
-
-                                let time = '';
-                                const timeMatch = liHtml.match(/class="[^"]*p[t]?date[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
-                                if (timeMatch && timeMatch[1]) {
-                                    time = timeMatch[1].trim();
-                                }
-
-                                if (text || html) {
-                                    const exists = messages.some(m => m.id === msgId || (m.peerId === peerId && m.type === type && (m.text === text || m.html === html) && m.time === time));
-                                    if (!exists) {
-                                        const newMsg = {
-                                            id: msgId,
-                                            peerId: String(peerId),
-                                            name: info.name,
-                                            avatar: info.avatar,
-                                            text: text || stripHtml(html),
-                                            html: html || text,
-                                            time: time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-                                            timestamp: Date.now(),
-                                            type: type,
-                                            synced: false
-                                        };
-                                        messages.push(newMsg);
-                                        newMessagesCaptured++;
-                                        console.log(`[Cloud Poller] 👻 Captured offline ${type} message from ${info.name} (${peerId}): ${text.substring(0, 40)}`);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.warn(`[Cloud Poller] Error fetching private_box for peer ${peerId}:`, e.message);
+            if (info.unreadCount > 0) {
+                lastPollStats.lastUnreadFound = info.unreadCount;
+                console.log(`[Cloud Poller] 👻 Unread private notification from ${info.name} (${peerId}): ${info.unreadCount} unread message(s) [Zero-Seen active, no HTTP write]`);
+                
+                // If socket is disconnected while unread messages are waiting, trigger reconnect to receive private-msg
+                if (!socketConnected) {
+                    console.log(`[Cloud Poller] Socket disconnected. Re-initializing socket listener for real-time capture...`);
+                    initChatSocket();
                 }
             }
-        }
-
-        if (newMessagesCaptured > 0) {
-            if (messages.length > 1500) messages = messages.slice(-1500);
-            saveJson(MESSAGES_FILE, messages);
-            console.log(`[Cloud Poller] Successfully saved ${newMessagesCaptured} new offline message(s) to cloud database!`);
         }
 
     } catch (err) {

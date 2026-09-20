@@ -165,16 +165,19 @@ function initChatSocket() {
     }
 
     console.log(`[Socket] Connecting to ${SITE_URL}${SOCKET_PATH}...`);
+    const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
     if (sessionData.cookies) {
-        console.log(`[Socket] Using authenticated session cookies (${sessionData.cookies.length} chars)`);
+        console.log(`[Socket] Using authenticated session cookies (${sessionData.cookies.length} chars, PHPSESSID: ${hasPhp ? 'Present' : 'MISSING'})`);
+        addLog(`[Socket] Connecting with cookies (length: ${sessionData.cookies.length}, PHPSESSID: ${hasPhp ? 'YES' : 'NO'})`);
     } else {
         console.log(`[Socket] Warning: No session cookies configured yet. Use /api/session to supply cookies.`);
+        addLog(`[Socket] Warning: No session cookies configured yet.`);
     }
 
     try {
         chatSocket = io(SITE_URL, {
             path: SOCKET_PATH,
-            transports: ['websocket', 'polling'],
+            transports: ['websocket'],
             extraHeaders: headers,
             reconnection: true,
             reconnectionDelay: 1000,
@@ -188,15 +191,11 @@ function initChatSocket() {
             lastConnectedTime = new Date().toISOString();
             lastError = null;
             addLog(`[Socket] Connected successfully! Socket ID: ${chatSocket.id}`);
-            try {
-                chatSocket.emit('switch-room');
-            } catch (e) {}
         });
 
         chatSocket.on('disconnect', (reason) => {
             socketConnected = false;
             addLog(`[Socket] Disconnected (reason: ${reason}). Triggering rapid reconnect...`);
-            // Socket.io does NOT auto-reconnect if server disconnected or idle close: force manual reconnect
             setTimeout(() => {
                 if (!socketConnected) {
                     addLog('[Socket] Executing watchdog auto-reconnect...');
@@ -393,16 +392,11 @@ function startPollingEngine() {
     setTimeout(pollArabicChatOnce, 1500);
     pollIntervalTimer = setInterval(pollArabicChatOnce, 5000);
 
-    // 10-second Active Socket Watchdog & Tunnel Heartbeat
+    // 10-second Active Socket Watchdog
     setInterval(() => {
         if (!chatSocket || !socketConnected || !chatSocket.connected) {
             console.log('[Socket Watchdog] Socket dropped or idle. Re-initializing immediately...');
             initChatSocket();
-        } else {
-            // Keep Cloudflare / Nginx websocket tunnel alive
-            try {
-                chatSocket.emit('switch-room');
-            } catch (e) {}
         }
     }, 10000);
 }
@@ -719,6 +713,8 @@ app.get('/', (req, res) => {
 
 // 2. Status API
 app.get('/api/status', (req, res) => {
+    const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
+    const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]) : [];
     res.json({
         ok: true,
         socketConnected: socketConnected,
@@ -726,6 +722,8 @@ app.get('/api/status', (req, res) => {
         hasSession: !!(sessionData.utk || sessionData.cookies),
         sessionUtkPresent: !!sessionData.utk,
         sessionCookiesPresent: !!sessionData.cookies,
+        hasPhpsessid: hasPhp,
+        cookieKeys: cookieKeys,
         sessionLastUpdated: sessionData.lastUpdated,
         lastConnectedTime: lastConnectedTime,
         lastError: lastError,
@@ -891,9 +889,28 @@ app.post('/api/session', requireAuth, (req, res) => {
     const { cookies, utk, userAgent } = req.body;
     let changed = false;
 
-    if (cookies && cookies !== sessionData.cookies) {
-        sessionData.cookies = cookies;
-        changed = true;
+    if (cookies) {
+        // Smart Cookie Merge: preserve existing PHPSESSID if incoming string doesn't supply one
+        const cookieMap = new Map();
+        if (sessionData.cookies) {
+            sessionData.cookies.split(';').forEach(pair => {
+                const parts = pair.trim().split('=');
+                if (parts[0]) cookieMap.set(parts[0], parts.slice(1).join('='));
+            });
+        }
+        cookies.split(';').forEach(pair => {
+            const parts = pair.trim().split('=');
+            if (parts[0]) cookieMap.set(parts[0], parts.slice(1).join('='));
+        });
+
+        const mergedCookies = Array.from(cookieMap.entries())
+            .map(([k, v]) => `${k}=${v}`)
+            .join('; ');
+
+        if (mergedCookies !== sessionData.cookies) {
+            sessionData.cookies = mergedCookies;
+            changed = true;
+        }
     }
     if (utk && utk !== sessionData.utk) {
         sessionData.utk = utk;
@@ -907,14 +924,18 @@ app.post('/api/session', requireAuth, (req, res) => {
     sessionData.lastUpdated = new Date().toISOString();
     saveJson(SESSION_FILE, sessionData);
 
-    console.log('[API] Session updated from extension! Reconnecting socket with fresh session...');
+    const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
+    addLog(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp ? 'YES' : 'NO'}). Reconnecting socket...`);
+    console.log(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp}). Reconnecting socket...`);
+
     initChatSocket();
     setTimeout(pollArabicChatOnce, 300);
 
     res.json({
         ok: true,
         message: 'Session stored and socket reconnecting with fresh credentials',
-        socketConnected: socketConnected
+        socketConnected: socketConnected,
+        hasPhpsessid: hasPhp
     });
 });
 

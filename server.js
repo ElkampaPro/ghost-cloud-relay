@@ -851,7 +851,18 @@ app.get('/api/conversations', requireAuth, (req, res) => {
         map[m.peerId].messages.push(m);
     });
 
-    const convs = Object.values(map).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
+    const convs = Object.values(map).map(c => {
+        c.messages.sort((a, b) => {
+            const tA = Number(a.timestamp) || 0;
+            const tB = Number(b.timestamp) || 0;
+            if (tA && tB && Math.abs(tA - tB) > 2000) return tA - tB;
+            const idA = parseInt(String(a.id).replace(/\D/g, ''), 10) || 0;
+            const idB = parseInt(String(b.id).replace(/\D/g, ''), 10) || 0;
+            if (idA && idB && idA !== idB) return idA - idB;
+            return tA - tB;
+        });
+        return c;
+    }).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
     res.json({ ok: true, count: convs.length, conversations: convs });
 });
 

@@ -174,11 +174,11 @@ function initChatSocket() {
     try {
         chatSocket = io(SITE_URL, {
             path: SOCKET_PATH,
-            transports: ['websocket'],
+            transports: ['websocket', 'polling'],
             extraHeaders: headers,
             reconnection: true,
-            reconnectionDelay: 2000,
-            reconnectionDelayMax: 30000,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 10000,
             autoConnect: true,
             timeout: 20000
         });
@@ -195,7 +195,14 @@ function initChatSocket() {
 
         chatSocket.on('disconnect', (reason) => {
             socketConnected = false;
-            addLog(`[Socket] Disconnected. Reason: ${reason}`);
+            addLog(`[Socket] Disconnected (reason: ${reason}). Triggering rapid reconnect...`);
+            // Socket.io does NOT auto-reconnect if server disconnected or idle close: force manual reconnect
+            setTimeout(() => {
+                if (!socketConnected) {
+                    addLog('[Socket] Executing watchdog auto-reconnect...');
+                    initChatSocket();
+                }
+            }, 1500);
         });
 
         chatSocket.on('connect_error', (err) => {
@@ -385,6 +392,19 @@ function startPollingEngine() {
     console.log('[Cloud Poller] Starting 24/7 background polling engine (interval: 5s)...');
     setTimeout(pollArabicChatOnce, 1500);
     pollIntervalTimer = setInterval(pollArabicChatOnce, 5000);
+
+    // 10-second Active Socket Watchdog & Tunnel Heartbeat
+    setInterval(() => {
+        if (!chatSocket || !socketConnected || !chatSocket.connected) {
+            console.log('[Socket Watchdog] Socket dropped or idle. Re-initializing immediately...');
+            initChatSocket();
+        } else {
+            // Keep Cloudflare / Nginx websocket tunnel alive
+            try {
+                chatSocket.emit('switch-room');
+            } catch (e) {}
+        }
+    }, 10000);
 }
 
 // Middleware
@@ -811,7 +831,7 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
         synced: true // Already handled by the reporting extension
     };
 
-    const exists = messages.some(m => m.id === incomingItem.id || (m.peerId === incomingItem.peerId && m.type === 'received' && (m.text === incomingItem.text || m.html === incomingItem.html) && m.time === incomingItem.time));
+    const exists = messages.some(m => m.id === incomingItem.id || (m.peerId === incomingItem.peerId && m.type === 'received' && m.text && incomingItem.text && m.text === incomingItem.text && Math.abs((m.timestamp || 0) - (incomingItem.timestamp || 0)) < 3000));
     if (!exists) {
         messages.push(incomingItem);
         if (messages.length > 1500) {

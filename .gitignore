@@ -1,4 +1,6 @@
 node_modules/
 service.log
-data/session.json
+*.log
+*.pid
+data/
 .env

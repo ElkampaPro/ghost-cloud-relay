@@ -1,3 +1,5 @@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "c:\Users\User\Desktop\Epro\ghost-cloud-server"
-WshShell.Run """C:\Program Files\nodejs\node.exe"" server.js", 0, False
+Set fso = CreateObject("Scripting.FileSystemObject")
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+WshShell.CurrentDirectory = scriptDir
+WshShell.Run "cmd /c run_service.bat", 0, False

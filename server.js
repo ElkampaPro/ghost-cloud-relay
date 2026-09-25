@@ -15,18 +15,35 @@ process.on('unhandledRejection', (reason) => {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const GHOST_SECRET = process.env.GHOST_SECRET || 'ghost_secret_2026';
+const GHOST_SECRET = (process.env.GHOST_SECRET || '').trim();
+if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') {
+    console.warn('[SECURITY WARNING] GHOST_SECRET is not configured or uses weak default. Authentication will fail closed until a valid non-default GHOST_SECRET is set.');
+}
 const SITE_URL = process.env.SITE_URL || 'https://www.arabic.chat';
 const SOCKET_PATH = process.env.SOCKET_PATH || '/io/';
 
-// Ensure data folder exists
-const DATA_DIR = path.join(__dirname, 'data');
+// Ensure data folder exists (configurable via DATA_DIR for persistent volume mounts e.g. /data on Render)
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 const SESSION_FILE = path.join(DATA_DIR, 'session.json');
+const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+const TRANSACTION_FILE = path.join(DATA_DIR, 'transaction.json');
+const DELETION_CUTOFFS_FILE = path.join(DATA_DIR, 'deletion_cutoffs.json');
+const PID_FILE = path.join(__dirname, 'server.pid');
+
+let storageHealth = { ok: true, error: null, lastIncident: null };
+
+try {
+    fs.writeFileSync(PID_FILE, String(process.pid));
+} catch (e) {}
+
+process.on('exit', () => {
+    try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (e) {}
+});
 
 // In-Memory Ring Buffer for Logs
 const serverLogs = [];
@@ -46,20 +63,117 @@ function loadJson(file, defVal) {
             return JSON.parse(data);
         }
     } catch (e) {
-        console.warn(`[Storage] Failed to read ${file}:`, e.message);
+        console.error(`[Storage] CRITICAL: Failed to parse ${file}: ${e.message}. Preserving original file to avoid data loss.`);
+        try {
+            const backup = `${file}.corrupt.${Date.now()}`;
+            fs.copyFileSync(file, backup);
+            console.warn(`[Storage] Corrupt file backed up to ${backup}`);
+        } catch (bErr) {}
     }
     return defVal;
 }
 
 function saveJson(file, data) {
+    let tmpFile = null;
     try {
-        fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+        const dir = path.dirname(file);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        tmpFile = path.join(dir, `.tmp_${path.basename(file)}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`);
+        fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf8');
+        fs.renameSync(tmpFile, file);
+        return true;
     } catch (e) {
+        if (tmpFile) {
+            try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (uErr) {}
+        }
         console.error(`[Storage] Failed to write ${file}:`, e.message);
+        return false;
     }
 }
 
+// Message Retention Policy
+const DEFAULT_MAX_MESSAGES = 5000;
+const MAX_MESSAGES = parseInt(process.env.GHOST_MAX_MESSAGES || '', 10) || DEFAULT_MAX_MESSAGES;
+
+function applyRetentionPolicy(candidateMessages) {
+    if (!Array.isArray(candidateMessages)) return [];
+    if (candidateMessages.length <= MAX_MESSAGES) {
+        return candidateMessages;
+    }
+    const dropCount = candidateMessages.length - MAX_MESSAGES;
+    const trimmed = candidateMessages.slice(-MAX_MESSAGES);
+    const line = `[RetentionPolicy] Global retention capacity reached (${candidateMessages.length}/${MAX_MESSAGES}). Trimmed ${dropCount} oldest message(s) under FIFO policy.`;
+    addLog(line);
+    console.warn(line);
+    return trimmed;
+}
+
 let messages = loadJson(MESSAGES_FILE, []);
+let deletionCutoffs = loadJson(DELETION_CUTOFFS_FILE, {});
+
+function isPeerTombstoned(owner, peerId, timestamp) {
+    if (!owner || !peerId) return false;
+    const key = `${owner}:${peerId}`;
+    const cutoff = Number(deletionCutoffs[key] || 0);
+    if (cutoff > 0 && Number(timestamp || 0) <= cutoff) {
+        return true;
+    }
+    return false;
+}
+
+function recordIncomingToPendingTransaction(item) {
+    if (!item || !item.id) return;
+    try {
+        if (fs.existsSync(TRANSACTION_FILE)) {
+            const tx = loadJson(TRANSACTION_FILE, null);
+            if (tx && tx.status && tx.status !== 'committed' && tx.previous && Array.isArray(tx.previous.messages)) {
+                if (!tx.previous.messages.some(m => m.id === item.id)) {
+                    tx.previous.messages.push(item);
+                    saveJson(TRANSACTION_FILE, tx);
+                }
+            }
+        }
+    } catch (_) {}
+}
+
+function getCompositeMessageKey(m) {
+    if (!m) return '';
+    const id = m.id !== undefined && m.id !== null ? String(m.id) : '';
+    const owner = m.owner || '';
+    const peerId = m.peerId !== undefined && m.peerId !== null ? String(m.peerId) : '';
+    const type = m.type || '';
+    return `${owner}:::${peerId}:::${type}:::${id}`;
+}
+
+function reconcileRecoveredMessagesList(previousJournalMessages, currentDiskMessages) {
+    const cutoffs = loadJson(DELETION_CUTOFFS_FILE, deletionCutoffs || {});
+    function isTombstonedRecovery(m) {
+        if (!m || !m.owner || !m.peerId) return false;
+        const key = `${m.owner}:${m.peerId}`;
+        const cutoff = Number(cutoffs[key] || 0);
+        return cutoff > 0 && Number(m.timestamp || 0) <= cutoff;
+    }
+
+    const mergedMessagesMap = new Map();
+    for (const m of (currentDiskMessages || [])) {
+        if (m && !isTombstonedRecovery(m)) {
+            const k = getCompositeMessageKey(m);
+            if (k) mergedMessagesMap.set(k, m);
+        }
+    }
+    for (const m of (previousJournalMessages || [])) {
+        if (m && !isTombstonedRecovery(m)) {
+            const k = getCompositeMessageKey(m);
+            if (k && !mergedMessagesMap.has(k)) {
+                mergedMessagesMap.set(k, m);
+            }
+        }
+    }
+    return applyRetentionPolicy(Array.from(mergedMessagesMap.values()));
+}
+
 let sessionData = loadJson(SESSION_FILE, {
     cookies: process.env.GHOST_COOKIES || '',
     utk: process.env.GHOST_UTK || '',
@@ -78,6 +192,330 @@ let chatSocket = null;
 let socketConnected = false;
 let lastConnectedTime = null;
 let lastError = null;
+let socketConnectingStartedAt = null;
+
+function extractExplicitUserId(cookies) {
+    if (cookies && typeof cookies === 'string') {
+        const u = cookies.match(/(?:user_id|my_id)=([^;]+)/i);
+        if (u) return u[1].trim();
+    }
+    return null;
+}
+
+function extractStableAccountId(cookies, utk) {
+    if (cookies && typeof cookies === 'string') {
+        const u = cookies.match(/(?:user_id|my_id)=([^;]+)/i);
+        if (u) return u[1].trim();
+        const p = cookies.match(/PHPSESSID=([^;]+)/i);
+        if (p) {
+            try {
+                const nodeCrypto = require('crypto');
+                return 'phpsess_' + nodeCrypto.createHash('sha256').update(p[1].trim()).digest('hex').slice(0, 12);
+            } catch (e) {
+                let h = 0;
+                const s = p[1].trim();
+                for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+                return 'phpsess_' + Math.abs(h).toString(16).padStart(8, '0');
+            }
+        }
+    }
+    if (utk && typeof utk === 'string' && utk.trim()) {
+        try {
+            const nodeCrypto = require('crypto');
+            return 'utk_' + nodeCrypto.createHash('sha256').update(utk.trim()).digest('hex').slice(0, 12);
+        } catch (e) {
+            let h = 0;
+            const s = utk.trim();
+            for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+            return 'utk_' + Math.abs(h).toString(16).padStart(8, '0');
+        }
+    }
+    return null;
+}
+
+// Account Sessions Registry (for multi-tenant and concurrent client session isolation)
+let accountSessions = loadJson(ACCOUNTS_FILE, {});
+
+// 1. Transaction Journal Recovery on Startup (restores pre-transaction consistent state if a crash or rollback failure occurred)
+try {
+    if (fs.existsSync(TRANSACTION_FILE)) {
+        const tx = loadJson(TRANSACTION_FILE, null);
+        if (tx && tx.status && tx.status !== 'committed' && tx.previous) {
+            console.warn(`[Startup Recovery] Uncommitted transaction ${tx.id} (${tx.status}) detected. Reconciling disk files...`);
+            let allRestored = true;
+            let recoveryError = null;
+
+            if (tx.previous.deletionCutoffs) {
+                if (saveJson(DELETION_CUTOFFS_FILE, tx.previous.deletionCutoffs)) {
+                    deletionCutoffs = tx.previous.deletionCutoffs;
+                } else {
+                    allRestored = false;
+                    recoveryError = 'Failed to restore deletion_cutoffs.json';
+                }
+            }
+            if (tx.previous.accounts) {
+                if (saveJson(ACCOUNTS_FILE, tx.previous.accounts)) {
+                    accountSessions = tx.previous.accounts;
+                } else {
+                    allRestored = false;
+                    recoveryError = (recoveryError ? recoveryError + '; ' : '') + 'Failed to restore accounts.json';
+                }
+            }
+            if (tx.previous.messages) {
+                // When restoring messages from an uncommitted transaction:
+                // Reconcile disk messages and journal messages with deletion cutoffs and composite message identity
+                const currentDiskMessages = loadJson(MESSAGES_FILE, messages || []);
+                const mergedMessages = reconcileRecoveredMessagesList(tx.previous.messages, currentDiskMessages);
+                if (saveJson(MESSAGES_FILE, mergedMessages)) {
+                    messages = mergedMessages;
+                } else {
+                    allRestored = false;
+                    recoveryError = (recoveryError ? recoveryError + '; ' : '') + 'Failed to restore messages.json';
+                }
+            }
+            if (tx.previous.session) {
+                if (saveJson(SESSION_FILE, tx.previous.session)) {
+                    sessionData = tx.previous.session;
+                } else {
+                    allRestored = false;
+                    recoveryError = (recoveryError ? recoveryError + '; ' : '') + 'Failed to restore session.json';
+                }
+            }
+
+            if (allRestored) {
+                // Verify all restored files exist and are valid JSON on disk before clearing journal
+                let verified = true;
+                if (tx.previous.accounts && !loadJson(ACCOUNTS_FILE, null)) verified = false;
+                if (tx.previous.messages && !loadJson(MESSAGES_FILE, null)) verified = false;
+                if (tx.previous.session && !loadJson(SESSION_FILE, null)) verified = false;
+
+                if (verified) {
+                    console.log(`[Startup Recovery] Successfully reconciled all files for transaction ${tx.id}. Clearing journal.`);
+                    try { fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+                    storageHealth = { ok: true, error: null, lastIncident: null };
+                } else {
+                    allRestored = false;
+                    recoveryError = 'Post-recovery file verification failed';
+                }
+            }
+
+            if (!allRestored) {
+                console.error(`[Startup Recovery] Recovery incomplete: ${recoveryError}. Retaining ${TRANSACTION_FILE} for retry.`);
+                storageHealth = {
+                    ok: false,
+                    error: `Startup recovery incomplete: ${recoveryError}`,
+                    lastIncident: new Date().toISOString()
+                };
+            }
+        } else if (tx && tx.status === 'committed') {
+            try { fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+        }
+    }
+} catch (txErr) {
+    console.error('[Startup Recovery] Transaction recovery error:', txErr.message);
+    storageHealth = {
+        ok: false,
+        error: `Startup recovery exception: ${txErr.message}`,
+        lastIncident: new Date().toISOString()
+    };
+}
+
+// 2. Legacy Raw PHPSESSID/utk Key Migration to Safe Hashes
+let accountsMigrated = false;
+let messagesMigrated = false;
+if (accountSessions && typeof accountSessions === 'object' && Object.keys(accountSessions).length > 0) {
+    const keyMap = new Map(); // oldRawKey -> canonicalSafeKey
+    for (const [key, acc] of Object.entries(accountSessions)) {
+        if (!acc) continue;
+        const canonical = extractStableAccountId(acc.cookies, acc.utk) || acc.accountKey;
+        if (!canonical) continue;
+        if (!Array.isArray(acc.legacyKeys)) acc.legacyKeys = [];
+
+        // 1. If key in accountSessions is legacy, re-key to canonical and preserve old key in legacyKeys
+        if (canonical !== key) {
+            console.log(`[Startup Migration] Migrating legacy account key from "${key.slice(0, 10)}..." to "${canonical}"`);
+            keyMap.set(key, canonical);
+            acc.accountKey = canonical;
+            if (!acc.legacyKeys.includes(key)) acc.legacyKeys.push(key);
+            accountSessions[canonical] = acc;
+            delete accountSessions[key];
+            accountsMigrated = true;
+        }
+
+        // 2. Register all known legacyKeys so message migration remains repeatable across restarts
+        for (const lk of acc.legacyKeys) {
+            if (lk && lk !== canonical) {
+                keyMap.set(lk, canonical);
+            }
+        }
+
+        // 3. Register raw PHPSESSID if present in cookies
+        const phpMatch = (acc.cookies || '').match(/PHPSESSID=([^;]+)/i);
+        if (phpMatch && phpMatch[1]) {
+            const rawPhp = phpMatch[1].trim();
+            if (rawPhp && rawPhp !== canonical) {
+                keyMap.set(rawPhp, canonical);
+                if (!acc.legacyKeys.includes(rawPhp)) {
+                    acc.legacyKeys.push(rawPhp);
+                    accountsMigrated = true;
+                }
+            }
+        }
+
+        // 4. Register raw utk / utks / historicUtks
+        if (acc.utk && acc.utk !== canonical) {
+            keyMap.set(acc.utk, canonical);
+        }
+        if (Array.isArray(acc.utks)) {
+            for (const u of acc.utks) {
+                if (u && u !== canonical) keyMap.set(u, canonical);
+            }
+        }
+        if (Array.isArray(acc.historicUtks)) {
+            for (const hu of acc.historicUtks) {
+                if (hu && hu !== canonical) keyMap.set(hu, canonical);
+            }
+        }
+    }
+
+    if (keyMap.size > 0 && Array.isArray(messages)) {
+        messages.forEach(m => {
+            if (m && m.owner && keyMap.has(m.owner)) {
+                const targetOwner = keyMap.get(m.owner);
+                if (m.owner !== targetOwner) {
+                    m.owner = targetOwner;
+                    messagesMigrated = true;
+                }
+            }
+        });
+    }
+
+    let migrationSaveFailed = false;
+    if (accountsMigrated) {
+        if (!saveJson(ACCOUNTS_FILE, accountSessions)) {
+            migrationSaveFailed = true;
+            console.error('[Startup Migration] Failed to persist migrated accounts.json');
+        }
+    }
+    if (messagesMigrated) {
+        if (!saveJson(MESSAGES_FILE, messages)) {
+            migrationSaveFailed = true;
+            console.error('[Startup Migration] Failed to persist migrated messages.json');
+        }
+    }
+    if (migrationSaveFailed) {
+        storageHealth = {
+            ok: false,
+            error: 'Startup migration persistence failure: unable to fully write accounts or messages to disk',
+            lastIncident: new Date().toISOString()
+        };
+    }
+}
+
+
+// 3. Startup reconciliation: Ensure sessionData aligns with authoritative accountSessions registry
+if (accountSessions && typeof accountSessions === 'object' && Object.keys(accountSessions).length > 0) {
+    const currentSessionKey = extractStableAccountId(sessionData.cookies, sessionData.utk);
+    const activeAccounts = Object.values(accountSessions).filter(acc => acc && !acc.revoked && (acc.cookies || acc.utk));
+
+    // If sessionData points to an uncommitted/orphaned account not in accountSessions:
+    if (currentSessionKey && (!accountSessions[currentSessionKey] || accountSessions[currentSessionKey].revoked)) {
+        console.warn(`[Startup] Detected orphaned session for ${currentSessionKey}. Reconciling with accounts.json...`);
+        if (activeAccounts.length > 0) {
+            sessionData.cookies = activeAccounts[0].cookies || '';
+            sessionData.utk = activeAccounts[0].utk || '';
+            sessionData.userAgent = activeAccounts[0].userAgent || '';
+            sessionData.lastUpdated = activeAccounts[0].lastUpdated || new Date().toISOString();
+        } else {
+            sessionData.cookies = '';
+            sessionData.utk = '';
+        }
+        saveJson(SESSION_FILE, sessionData);
+    } else if ((!sessionData.cookies || !sessionData.utk) && activeAccounts.length > 0) {
+        if (!sessionData.cookies && activeAccounts[0].cookies) sessionData.cookies = activeAccounts[0].cookies;
+        if (!sessionData.utk && activeAccounts[0].utk) sessionData.utk = activeAccounts[0].utk;
+        if (!sessionData.userAgent && activeAccounts[0].userAgent) sessionData.userAgent = activeAccounts[0].userAgent;
+    }
+}
+
+function generateRecoveryKey() {
+    try {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+            return 'rec_' + crypto.randomUUID().replace(/-/g, '');
+        }
+        const nodeCrypto = require('crypto');
+        return 'rec_' + nodeCrypto.randomBytes(16).toString('hex');
+    } catch (e) {
+        return 'rec_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    }
+}
+
+function getAdminRecoveryKey() {
+    return (process.env.GHOST_ADMIN_KEY || process.env.GHOST_RECOVERY_KEY || '').trim();
+}
+
+function hasRegisteredAccounts() {
+    for (const acc of Object.values(accountSessions)) {
+        if (acc && !acc.revoked && ((acc.utks && acc.utks.length > 0) || acc.utk || acc.cookies)) return true;
+    }
+    if (sessionData && (sessionData.utk || sessionData.cookies)) return true;
+    return false;
+}
+
+function getOwnerId(req) {
+    // 1. Authenticated client context via request headers, body, or query
+    if (req) {
+        const headers = req.headers || {};
+        const clientToken = headers['x-ghost-token'] || (req.body && (req.body.sessionToken || req.body.token)) || (req.query && (req.query.sessionToken || req.query.token));
+        if (clientToken && typeof clientToken === 'string') {
+            const cleanToken = clientToken.trim();
+            for (const [key, acc] of Object.entries(accountSessions)) {
+                if (!acc.revoked && (acc.utk === cleanToken || (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)))) {
+                    return key;
+                }
+            }
+            return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+        }
+
+        // x-ghost-session header without secret token is explicitly rejected to prevent forgery
+        if (headers['x-ghost-session']) {
+            return 'unauthorized_forged_session';
+        }
+
+        // When registered accounts exist, any HTTP request lacking an account token is unauthorized
+        if (hasRegisteredAccounts()) {
+            return 'unauthorized_missing_token';
+        }
+
+        return 'default_owner';
+    }
+
+    // 2. Default to active sessionData on the server ONLY for internal background operations (socket / poller where req is null/undefined)
+    if (sessionData) {
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk);
+        if (stableId) return stableId;
+    }
+
+    return 'default_owner';
+}
+
+
+function isDuplicateMessage(existing, incoming) {
+    if (!existing || !incoming) return false;
+    if (existing.id && incoming.id && String(existing.id) === String(incoming.id)) {
+        if (existing.owner && incoming.owner && existing.owner !== incoming.owner) {
+            return false;
+        }
+        if (existing.peerId && incoming.peerId && String(existing.peerId) !== String(incoming.peerId)) {
+            return false;
+        }
+        if (existing.type && incoming.type && existing.type !== incoming.type) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
 
 // Clean text helpers
 function stripHtml(html) {
@@ -85,7 +523,7 @@ function stripHtml(html) {
     return html.replace(/<[^>]*>?/gm, '').trim();
 }
 
-function parseIncomingMessage(data) {
+function parseIncomingMessage(data, targetOwner = null) {
     if (!data) return null;
     const peerId = String(data.peer || data.target || '');
     if (!peerId || peerId === '0') return null;
@@ -114,12 +552,11 @@ function parseIncomingMessage(data) {
 
         // Extract content
         const contentMatch = msgHtml.match(/class="[^"]*(?:target_private|hunter_private|private_content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-        if (contentMatch && contentMatch[1]) {
-            msgHtml = contentMatch[1].trim();
-            msgText = stripHtml(msgHtml);
-        } else {
-            msgText = stripHtml(msgHtml);
-        }
+        let bubbleHtml = contentMatch && contentMatch[1] ? contentMatch[1].trim() : msgHtml;
+        bubbleHtml = bubbleHtml.replace(/<span[^>]*class="[^"]*(?:username|user_name|target_name)[^"]*"[^>]*>[\s\S]*?<\/span>/gi, '').trim();
+        bubbleHtml = bubbleHtml.replace(/<img[^>]*class="[^"]*(?:avatar_private|private_avatar)[^"]*"[^>]*>/gi, '').trim();
+        msgHtml = bubbleHtml;
+        msgText = (data.message || data.msg || data.content) ? String(data.message || data.msg || data.content).trim() : stripHtml(msgHtml);
     } else if (data.message || data.msg || data.content) {
         msgText = String(data.message || data.msg || data.content);
         msgHtml = msgText;
@@ -139,43 +576,84 @@ function parseIncomingMessage(data) {
         html: msgHtml || msgText,
         time: timeNow,
         timestamp: Date.now(),
-        type: 'received',
-        synced: false
+        type: (data.own || data.is_own || data.hunter || (data.html && /hunter_private/i.test(String(data.html)))) ? 'sent' : 'received',
+        synced: false,
+        owner: targetOwner || getOwnerId(null)
     };
 }
 
-// Socket Connection Handler
-function initChatSocket() {
-    if (chatSocket) {
+// ==========================================
+// Multi-Account Background Socket Pool
+// ==========================================
+const accountSockets = new Map(); // accKey -> { socket, connected, cookies, utk }
+
+function disconnectAccountSocket(accKey) {
+    if (accountSockets.has(accKey)) {
+        const item = accountSockets.get(accKey);
         try {
-            chatSocket.removeAllListeners();
-            chatSocket.disconnect();
-        } catch (e) { }
-        chatSocket = null;
+            if (item.socket) {
+                item.socket.removeAllListeners();
+                item.socket.disconnect();
+            }
+        } catch (e) {}
+        accountSockets.delete(accKey);
+        addLog(`[SocketPool] Disconnected background socket for account: ${accKey}`);
+    }
+}
+
+const SOCKET_CONNECT_TIMEOUT = 20000;
+
+function connectAccountSocket(accKey, cookies, utk, userAgent) {
+    if (!cookies || !utk) return null;
+
+    if (accountSockets.has(accKey)) {
+        const existing = accountSockets.get(accKey);
+        const credentialsMatch = existing.cookies === cookies && existing.utk === utk;
+
+        if (credentialsMatch && existing.socket) {
+            // 1. If live and connected, return existing live socket
+            if (existing.socket.connected && existing.connected) {
+                existing.connecting = false;
+                return existing.socket;
+            }
+
+            // 2. If a connection attempt is actively in progress within timeout, do not tear down prematurely
+            const elapsed = existing.connectingStartedAt ? (Date.now() - existing.connectingStartedAt) : 0;
+            if (existing.connecting && elapsed < SOCKET_CONNECT_TIMEOUT) {
+                return existing.socket;
+            }
+
+            // 3. Initiate or retry connect() on existing socket
+            if (typeof existing.socket.connect === 'function') {
+                try {
+                    existing.connecting = true;
+                    existing.connectingStartedAt = Date.now();
+                    existing.socket.connect();
+                    if (existing.socket.connected) {
+                        existing.connected = true;
+                        existing.connecting = false;
+                        existing.lastError = null;
+                    }
+                    return existing.socket;
+                } catch (e) {
+                    existing.connecting = false;
+                }
+            }
+        }
+
+        disconnectAccountSocket(accKey);
     }
 
     const headers = {
         'Origin': SITE_URL,
         'Referer': SITE_URL + '/',
-        'User-Agent': sessionData.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        'User-Agent': userAgent || (sessionData && sessionData.userAgent) || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Cookie': cookies
     };
 
-    if (sessionData.cookies) {
-        headers['Cookie'] = sessionData.cookies;
-    }
-
-    console.log(`[Socket] Connecting to ${SITE_URL}${SOCKET_PATH}...`);
-    const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
-    if (sessionData.cookies) {
-        console.log(`[Socket] Using authenticated session cookies (${sessionData.cookies.length} chars, PHPSESSID: ${hasPhp ? 'Present' : 'MISSING'})`);
-        addLog(`[Socket] Connecting with cookies (length: ${sessionData.cookies.length}, PHPSESSID: ${hasPhp ? 'YES' : 'NO'})`);
-    } else {
-        console.log(`[Socket] Warning: No session cookies configured yet. Use /api/session to supply cookies.`);
-        addLog(`[Socket] Warning: No session cookies configured yet.`);
-    }
-
+    console.log(`[SocketPool] Connecting socket for account ${accKey} to ${SITE_URL}${SOCKET_PATH}...`);
     try {
-        chatSocket = io(SITE_URL, {
+        const sock = io(SITE_URL, {
             path: SOCKET_PATH,
             transports: ['websocket'],
             extraHeaders: headers,
@@ -186,73 +664,136 @@ function initChatSocket() {
             timeout: 20000
         });
 
-        chatSocket.on('connect', () => {
+        const entry = {
+            socket: sock,
+            connected: Boolean(sock.connected),
+            connecting: !sock.connected,
+            connectingStartedAt: sock.connected ? null : Date.now(),
+            cookies: cookies,
+            utk: utk,
+            lastConnectedTime: sock.connected ? new Date().toISOString() : null,
+            lastError: null,
+            lastMessageTime: null
+        };
+        accountSockets.set(accKey, entry);
+        chatSocket = sock; // Maintain backward compatibility for single-socket callers and tests
+        if (sock.connected) {
             socketConnected = true;
-            lastConnectedTime = new Date().toISOString();
+            lastConnectedTime = entry.lastConnectedTime;
+        }
+
+        sock.on('connect', () => {
+            entry.connected = true;
+            entry.connecting = false;
+            entry.connectingStartedAt = null;
+            entry.lastConnectedTime = new Date().toISOString();
+            entry.lastError = null;
+            socketConnected = true;
+            lastConnectedTime = entry.lastConnectedTime;
             lastError = null;
-            addLog(`[Socket] Connected successfully! Socket ID: ${chatSocket.id}`);
+            addLog(`[Socket:${accKey}] Connected successfully! Socket ID: ${sock.id}`);
         });
 
-        chatSocket.on('disconnect', (reason) => {
-            socketConnected = false;
-            addLog(`[Socket] Disconnected (reason: ${reason}). Triggering rapid reconnect...`);
-            setTimeout(() => {
-                if (!socketConnected) {
-                    addLog('[Socket] Executing watchdog auto-reconnect...');
-                    initChatSocket();
-                }
-            }, 1500);
+        sock.on('disconnect', (reason) => {
+            entry.connected = false;
+            entry.connecting = false;
+            socketConnected = Array.from(accountSockets.values()).some(e => e.connected);
+            addLog(`[Socket:${accKey}] Disconnected (reason: ${reason})`);
         });
 
-        chatSocket.on('connect_error', (err) => {
-            socketConnected = false;
-            lastError = err ? err.message : 'Unknown connect error';
-            addLog(`[Socket] Connection error: ${lastError}`);
+        sock.on('connect_error', (err) => {
+            entry.connected = false;
+            entry.connecting = false;
+            entry.lastError = err ? err.message : 'Unknown connect error';
+            socketConnected = Array.from(accountSockets.values()).some(e => e.connected);
+            lastError = entry.lastError;
+            addLog(`[Socket:${accKey}] Connection error: ${entry.lastError}`);
         });
 
-        chatSocket.on('error', (err) => {
-            addLog(`[Socket] Generic socket error: ${err}`);
+        sock.on('error', (err) => {
+            addLog(`[Socket:${accKey}] Generic socket error: ${err}`);
         });
 
-        if (chatSocket.io) {
-            chatSocket.io.on('error', (err) => {
-                addLog(`[Socket Manager] Engine error: ${err}`);
+        if (sock.io) {
+            sock.io.on('error', (err) => {
+                addLog(`[Socket Manager:${accKey}] Engine error: ${err}`);
             });
-            chatSocket.io.on('reconnect_error', (err) => {
-                addLog(`[Socket Manager] Reconnect error: ${err}`);
+            sock.io.on('reconnect_error', (err) => {
+                addLog(`[Socket Manager:${accKey}] Reconnect error: ${err}`);
             });
         }
 
-        chatSocket.onAny((event, ...args) => {
+        sock.onAny((event, ...args) => {
             if (event !== 'ping' && event !== 'pong') {
-                addLog(`[Socket Event] ${event}: ${JSON.stringify(args).substring(0, 120)}`);
+                if (event === 'private-msg' || event.includes('msg')) {
+                    addLog(`[Socket Event:${accKey}] ${event} (payload redacted for privacy)`);
+                } else {
+                    addLog(`[Socket Event:${accKey}] ${event}`);
+                }
             }
         });
 
-        chatSocket.on('private-msg', (data) => {
+        sock.on('private-msg', (data) => {
             try {
-                addLog('[Socket] Incoming private-msg received!');
-                const parsed = parseIncomingMessage(data);
+                entry.lastMessageTime = new Date().toISOString();
+                addLog(`[Socket:${accKey}] Incoming private-msg received!`);
+                const parsed = parseIncomingMessage(data, accKey);
                 if (!parsed) return;
 
-                // Check for duplicate
-                const exists = messages.some(m => m.id === parsed.id);
+                if (isPeerTombstoned(accKey, parsed.peerId, parsed.timestamp)) {
+                    addLog(`[Socket:${accKey}] Dropping tombstoned message for peer ${parsed.peerId}`);
+                    return;
+                }
+
+                // Check for duplicate using composite logic
+                const exists = messages.some(m => isDuplicateMessage(m, parsed));
                 if (!exists) {
-                    messages.push(parsed);
-                    if (messages.length > 1000) {
-                        messages = messages.slice(-1000);
+                    const candidate = [...messages, parsed];
+                    const trimmed = applyRetentionPolicy(candidate);
+                    const saved = saveJson(MESSAGES_FILE, trimmed);
+                    if (saved) {
+                        messages = trimmed;
+                        recordIncomingToPendingTransaction(parsed);
+                        addLog(`[Ghost Cloud] Captured message for account ${accKey} (id: ${parsed.id})`);
+                    } else {
+                        console.error('[Socket] Failed to persist captured message to disk');
                     }
-                    saveJson(MESSAGES_FILE, messages);
-                    addLog(`[Ghost Cloud] Captured message from ${parsed.name} (${parsed.peerId}): ${parsed.text.substring(0, 40)}`);
                 }
             } catch (err) {
-                console.error('[Socket] Error processing private-msg:', err);
+                console.error(`[Socket:${accKey}] Error processing private-msg:`, err);
             }
         });
 
+        return sock;
     } catch (e) {
         lastError = e.message;
-        addLog(`[Socket] Exception initializing socket: ${e.message}`);
+        addLog(`[Socket:${accKey}] Exception initializing socket: ${e.message}`);
+        return null;
+    }
+}
+
+function initChatSocket() {
+    // 1. Remove sockets for revoked or non-existent accounts
+    for (const [k, entry] of accountSockets.entries()) {
+        const acc = accountSessions[k];
+        if (!acc || acc.revoked || !acc.cookies || !acc.utk) {
+            disconnectAccountSocket(k);
+        }
+    }
+
+    // 2. Connect sockets for all active registered accounts
+    let connectedAny = false;
+    for (const [accKey, acc] of Object.entries(accountSessions)) {
+        if (acc && !acc.revoked && acc.cookies && acc.utk) {
+            connectAccountSocket(accKey, acc.cookies, acc.utk, acc.userAgent);
+            connectedAny = true;
+        }
+    }
+
+    // 3. Fallback: if no registered accounts in accountSessions but sessionData has credentials
+    if (!connectedAny && sessionData && sessionData.cookies && sessionData.utk) {
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+        connectAccountSocket(stableId, sessionData.cookies, sessionData.utk, sessionData.userAgent);
     }
 }
 
@@ -269,50 +810,45 @@ let lastPollStats = {
     lastError: null
 };
 
-async function pollArabicChatOnce() {
-    if (!sessionData.utk && !sessionData.cookies) {
-        lastPollStats.status = 'no_credentials';
-        return;
-    }
-    if (isPollingActive) return;
-    isPollingActive = true;
+async function pollSingleAccount(target) {
+    if (!target.cookies && !target.utk) return;
 
     try {
         const headers = {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
             'X-Requested-With': 'XMLHttpRequest',
-            'User-Agent': sessionData.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'User-Agent': target.userAgent || (sessionData && sessionData.userAgent) || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
             'Origin': SITE_URL,
             'Referer': `${SITE_URL}/`
         };
-        if (sessionData.cookies) {
-            headers['Cookie'] = sessionData.cookies;
+        if (target.cookies) {
+            headers['Cookie'] = target.cookies;
         }
 
-        const bodyData = sessionData.utk ? `token=${encodeURIComponent(sessionData.utk)}` : '';
+        const bodyData = target.utk ? `token=${encodeURIComponent(target.utk)}` : '';
 
         // 1. Poll private_notify.php
         const notifyRes = await fetch(`${SITE_URL}/system/box/private_notify.php`, {
             method: 'POST',
             headers: headers,
-            body: bodyData
+            body: bodyData,
+            signal: AbortSignal.timeout(10000)
         });
 
         // 1.1 Zero-Seen Keep-Alive Heartbeat (priv=0 ensures no message is marked read)
-        // Keeps user online in database so chat-gateway continues dispatching private-msg to the socket
-        if (sessionData.utk) {
+        if (target.utk) {
             try {
                 fetch(`${SITE_URL}/system/chat_log.php`, {
                     method: 'POST',
                     headers: headers,
-                    body: `fload=0&caction=0&taction=0&last=0&snum=0&preload=0&priv=0&lastp=0&pcount=0&room=1&notify=0&token=${encodeURIComponent(sessionData.utk)}&r=${Date.now()}`
+                    body: `fload=0&caction=0&taction=0&last=0&snum=0&preload=0&priv=0&lastp=0&pcount=0&room=1&notify=0&token=${encodeURIComponent(target.utk)}&r=${Date.now()}`,
+                    signal: AbortSignal.timeout(10000)
                 }).catch(() => {});
             } catch (err) {}
         }
 
         if (!notifyRes.ok) {
             lastPollStats.status = `HTTP_${notifyRes.status}`;
-            isPollingActive = false;
             return;
         }
 
@@ -321,10 +857,7 @@ async function pollArabicChatOnce() {
         lastPollStats.totalCycles++;
         lastPollStats.status = 'ok';
 
-        if (!notifyHtml || notifyHtml.trim().length === 0) {
-            isPollingActive = false;
-            return;
-        }
+        if (!notifyHtml || notifyHtml.trim().length === 0) return;
 
         // 2. Parse contacts from notifyHtml
         const rawBlocks = notifyHtml.split(/(?=<div[^>]*class="[^"]*ulist_item)/i);
@@ -356,11 +889,9 @@ async function pollArabicChatOnce() {
         }
 
         // 2. Parse contacts from notifyHtml (Read-only, Zero-Seen compliant)
-        // Strictly NEVER fetch system/private_box.php here: private_box.php updates seen=1 on the server!
         for (const [peerId, info] of peersToCheck.entries()) {
-            // Update names and avatars for existing stored messages if improved info was parsed
             messages.forEach(m => {
-                if (m.peerId === peerId) {
+                if (m.peerId === peerId && (!m.owner || m.owner === target.key)) {
                     if (info.name && m.name === ('مستخدم ' + peerId)) m.name = info.name;
                     if (info.avatar && m.avatar === 'default_images/avatar/default_avatar.png') m.avatar = info.avatar;
                 }
@@ -368,19 +899,43 @@ async function pollArabicChatOnce() {
 
             if (info.unreadCount > 0) {
                 lastPollStats.lastUnreadFound = info.unreadCount;
-                console.log(`[Cloud Poller] 👻 Unread private notification from ${info.name} (${peerId}): ${info.unreadCount} unread message(s) [Zero-Seen active, no HTTP write]`);
-                
-                // If socket is disconnected while unread messages are waiting, trigger reconnect to receive private-msg
-                if (!socketConnected) {
-                    console.log(`[Cloud Poller] Socket disconnected. Re-initializing socket listener for real-time capture...`);
-                    initChatSocket();
+                console.log(`[Cloud Poller:${target.key}] 👻 Unread private notification from ${info.name} (${peerId}): ${info.unreadCount} unread message(s) [Zero-Seen active]`);
+
+                const sockEntry = accountSockets.get(target.key);
+                if (!sockEntry || !sockEntry.connected || !sockEntry.socket || !sockEntry.socket.connected) {
+                    console.log(`[Cloud Poller:${target.key}] Socket disconnected for account ${target.key}. Reconnecting this account...`);
+                    connectAccountSocket(target.key, target.cookies, target.utk, target.userAgent);
                 }
             }
         }
-
     } catch (err) {
         lastPollStats.lastError = err.message;
-        console.warn('[Cloud Poller] Polling cycle error:', err.message);
+        console.warn(`[Cloud Poller:${target.key}] Polling cycle error:`, err.message);
+    }
+}
+
+async function pollArabicChatOnce() {
+    const targets = [];
+    for (const [k, acc] of Object.entries(accountSessions)) {
+        if (acc && !acc.revoked && (acc.cookies || acc.utk)) {
+            targets.push({ key: k, cookies: acc.cookies, utk: acc.utk, userAgent: acc.userAgent });
+        }
+    }
+    if (targets.length === 0 && sessionData && (sessionData.utk || sessionData.cookies)) {
+        targets.push({ key: 'default', cookies: sessionData.cookies, utk: sessionData.utk, userAgent: sessionData.userAgent });
+    }
+
+    if (targets.length === 0) {
+        lastPollStats.status = 'no_credentials';
+        return;
+    }
+    if (isPollingActive) return;
+    isPollingActive = true;
+
+    try {
+        for (const target of targets) {
+            await pollSingleAccount(target);
+        }
     } finally {
         isPollingActive = false;
     }
@@ -392,11 +947,39 @@ function startPollingEngine() {
     setTimeout(pollArabicChatOnce, 1500);
     pollIntervalTimer = setInterval(pollArabicChatOnce, 5000);
 
-    // 10-second Active Socket Watchdog
+    // 10-second Active Socket Watchdog (Per-Account Recovery)
     setInterval(() => {
-        if (!chatSocket || !socketConnected || !chatSocket.connected) {
-            console.log('[Socket Watchdog] Socket dropped or idle. Re-initializing immediately...');
-            initChatSocket();
+        const hasSessionCreds = Boolean(sessionData && (sessionData.cookies || sessionData.utk));
+        const hasActiveAccounts = Object.values(accountSessions).some(a => !a.revoked && a.cookies && a.utk);
+        if (!hasSessionCreds && !hasActiveAccounts) {
+            return; // Suspended: no active credentials or explicitly revoked
+        }
+        if (socketConnectingStartedAt && (Date.now() - socketConnectingStartedAt < 25000)) {
+            return; // Allow active handshake up to 25s without premature termination
+        }
+
+        let hasActiveTarget = false;
+        for (const [accKey, acc] of Object.entries(accountSessions)) {
+            if (acc && !acc.revoked && acc.cookies && acc.utk) {
+                hasActiveTarget = true;
+                const entry = accountSockets.get(accKey);
+                const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 20000);
+                if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
+                    console.log(`[Socket Watchdog] Socket dropped or idle for account ${accKey}. Reconnecting account ${accKey}...`);
+                    connectAccountSocket(accKey, acc.cookies, acc.utk, acc.userAgent);
+                }
+            }
+        }
+
+        // Fallback for single sessionData if accountSessions has no active targets
+        if (!hasActiveTarget && sessionData && sessionData.cookies && sessionData.utk) {
+            const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+            const entry = accountSockets.get(stableId);
+            const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 20000);
+            if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
+                console.log(`[Socket Watchdog] Fallback socket dropped or idle for ${stableId}. Reconnecting...`);
+                connectAccountSocket(stableId, sessionData.cookies, sessionData.utk, sessionData.userAgent);
+            }
         }
     }, 10000);
 }
@@ -406,11 +989,19 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+function checkAuth(req) {
+    if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') return false;
+    const key = (req.headers && req.headers['x-ghost-secret']) || (req.body && req.body.key) || (req.query && req.query.key);
+    return Boolean(key && key === GHOST_SECRET && key !== 'ghost_secret_2026');
+}
+
 // Auth middleware for /api/*
 function requireAuth(req, res, next) {
-    const key = req.headers['x-ghost-secret'] || req.query.key || (req.body && req.body.key);
-    if (!key || (key !== GHOST_SECRET && key !== 'ghost_secret_2026')) {
-        return res.status(401).json({ ok: false, error: 'Unauthorized: Invalid or missing secret key' });
+    if (!checkAuth(req)) {
+        if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') {
+            return res.status(401).json({ ok: false, error: 'Unauthorized: Server secret is not configured or uses insecure default' });
+        }
+        return res.status(401).json({ ok: false, error: 'Unauthorized: Invalid secret key' });
     }
     next();
 }
@@ -507,6 +1098,7 @@ app.get('/', (req, res) => {
             <h2><i class="fa fa-ghost"></i> شبح الخاص السحابي</h2>
             <p>أدخل المفتاح السري (Secret Key) لفتح ومزامنة محادثات الشات الخاصة بك مباشرة على هاتفك.</p>
             <input type="password" id="secret_input" class="login_input" placeholder="أدخل المفتاح السري هنا...">
+            <input type="text" id="token_input" class="login_input" placeholder="رمز الحساب الموثق (إلزامي / Account Token)">
             <button id="login_btn" class="login_btn"><i class="fa fa-unlock-alt"></i> تسجيل الدخول والمزامنة</button>
         </div>
     </div>
@@ -559,11 +1151,13 @@ app.get('/', (req, res) => {
 
     <script>
         let SECRET_KEY = localStorage.getItem('ghost_secret_key') || '';
+        let ACCOUNT_TOKEN = localStorage.getItem('ghost_account_token') || '';
         let conversations = [];
         let activePeerId = null;
 
         const loginOverlay = document.getElementById('login_overlay');
         const secretInput = document.getElementById('secret_input');
+        const tokenInput = document.getElementById('token_input');
         const loginBtn = document.getElementById('login_btn');
         const appContainer = document.getElementById('app_container');
         const contactsList = document.getElementById('contacts_list');
@@ -575,23 +1169,40 @@ app.get('/', (req, res) => {
         const refreshBtn = document.getElementById('refresh_btn');
         const logoutBtn = document.getElementById('logout_btn');
 
-        if (SECRET_KEY) {
+        if (SECRET_KEY && ACCOUNT_TOKEN) {
             loginOverlay.style.display = 'none';
             initApp();
+        } else {
+            loginOverlay.style.display = 'flex';
         }
 
         loginBtn.onclick = function () {
             const key = secretInput.value.trim();
             if (!key) return alert("يرجى كتابة المفتاح السري");
+            const token = tokenInput ? tokenInput.value.trim() : '';
+            if (!token) return alert("يرجى إدخال رمز الحساب الموثق (Account Token)");
             SECRET_KEY = key;
+            ACCOUNT_TOKEN = token;
             localStorage.setItem('ghost_secret_key', key);
+            localStorage.setItem('ghost_account_token', token);
             loginOverlay.style.display = 'none';
             initApp();
         };
 
         logoutBtn.onclick = function () {
             if (confirm("تسجيل الخروج من لوحة الشبح؟")) {
+                if (SECRET_KEY && ACCOUNT_TOKEN) {
+                    fetch('/api/logout', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-ghost-secret': SECRET_KEY,
+                            'x-ghost-token': ACCOUNT_TOKEN
+                        }
+                    }).catch(() => {});
+                }
                 localStorage.removeItem('ghost_secret_key');
+                localStorage.removeItem('ghost_account_token');
                 location.reload();
             }
         };
@@ -611,11 +1222,18 @@ app.get('/', (req, res) => {
         }
 
         function fetchConversations() {
-            if (!SECRET_KEY) return;
-            fetch('/api/conversations?key=' + encodeURIComponent(SECRET_KEY))
+            if (!SECRET_KEY || !ACCOUNT_TOKEN) return;
+            const headers = {
+                'x-ghost-secret': SECRET_KEY,
+                'x-ghost-token': ACCOUNT_TOKEN
+            };
+            fetch('/api/conversations', {
+                headers: headers
+            })
                 .then(r => {
                     if (r.status === 401) {
                         localStorage.removeItem('ghost_secret_key');
+                        localStorage.removeItem('ghost_account_token');
                         loginOverlay.style.display = 'flex';
                         throw new Error("Invalid Secret");
                     }
@@ -635,6 +1253,13 @@ app.get('/', (req, res) => {
                 });
         }
 
+        function escapeClientHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/[&<>"']/g, function(c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
         function renderContactsList() {
             const q = (searchInput.value || '').trim().toLowerCase();
             const filtered = conversations.filter(c => !q || (c.name && c.name.toLowerCase().includes(q)) || c.peerId.includes(q));
@@ -646,21 +1271,34 @@ app.get('/', (req, res) => {
 
             contactsList.innerHTML = filtered.map(c => {
                 const isActive = c.peerId === activePeerId;
-                const avatar = c.avatar.startsWith('http') ? c.avatar : ('https://www.arabic.chat/' + c.avatar.replace(/^\\/+/, ''));
+                const rawAv = c.avatar || 'default_images/avatar/default_avatar.png';
+                const avatar = rawAv.startsWith('http') ? rawAv : ('https://www.arabic.chat/' + rawAv.replace(/^\\/+/, ''));
+                const safeAvatar = escapeClientHtml(avatar);
+                const safePeerId = escapeClientHtml(c.peerId);
+                const safeName = escapeClientHtml(c.name || ('مستخدم ' + c.peerId));
+                const safeTime = escapeClientHtml(c.lastTime || '');
+                const safeSnippet = escapeClientHtml(c.lastText || 'رسالة خاصة');
                 return \`
-                    <li class="contact_item \${isActive ? 'active' : ''}" onclick="openChat('\${c.peerId}')">
-                        <img class="contact_avatar" src="\${avatar}" onerror="this.src='https://www.arabic.chat/default_images/avatar/default_avatar.png'">
+                    <li class="contact_item \${isActive ? 'active' : ''}" data-peer="\${safePeerId}">
+                        <img class="contact_avatar" src="\${safeAvatar}" onerror="this.src='https://www.arabic.chat/default_images/avatar/default_avatar.png'">
                         <div class="contact_info">
                             <div class="contact_header">
-                                <span class="contact_name">\${c.name}</span>
-                                <span class="contact_time">\${c.lastTime || ''}</span>
+                                <span class="contact_name">\${safeName}</span>
+                                <span class="contact_time">\${safeTime}</span>
                             </div>
-                            <div class="contact_snippet">\${c.lastText || 'رسالة خاصة'}</div>
+                            <div class="contact_snippet">\${safeSnippet}</div>
                         </div>
                     </li>
                 \`;
             }).join('');
         }
+
+        contactsList.addEventListener('click', function (e) {
+            const item = e.target.closest('li.contact_item');
+            if (item && item.getAttribute('data-peer')) {
+                openChat(item.getAttribute('data-peer'));
+            }
+        });
 
         window.openChat = function (peerId) {
             activePeerId = peerId;
@@ -674,6 +1312,76 @@ app.get('/', (req, res) => {
             renderActiveMessages(true);
         };
 
+        function sanitizeClientHtml(htmlStr) {
+            if (!htmlStr) return '';
+            // If DOMParser is available (browser environment)
+            if (typeof DOMParser !== 'undefined') {
+                try {
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(String(htmlStr), 'text/html');
+                    const ALLOWED_TAGS = new Set(['div', 'span', 'p', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'br', 'hr', 'img', 'audio', 'video', 'source', 'a']);
+                    const ALLOWED_ATTRS = {
+                        'img': new Set(['src', 'alt', 'class', 'style', 'width', 'height', 'loading']),
+                        'audio': new Set(['src', 'controls', 'class', 'style', 'preload']),
+                        'video': new Set(['src', 'controls', 'class', 'style', 'preload', 'width', 'height']),
+                        'source': new Set(['src', 'type']),
+                        'a': new Set(['href', 'target', 'rel', 'class', 'style']),
+                        '*': new Set(['class', 'style'])
+                    };
+
+                    const elements = doc.body.querySelectorAll('*');
+                    elements.forEach(function (el) {
+                        const tag = el.tagName.toLowerCase();
+                        if (!ALLOWED_TAGS.has(tag)) {
+                            el.remove();
+                            return;
+                        }
+                        Array.from(el.attributes).forEach(function (attr) {
+                            const name = attr.name.toLowerCase();
+                            if (name.startsWith('on') || (!ALLOWED_ATTRS['*'].has(name) && !(ALLOWED_ATTRS[tag] && ALLOWED_ATTRS[tag].has(name)))) {
+                                el.removeAttribute(attr.name);
+                                return;
+                            }
+                            if (name === 'href' || name === 'src') {
+                                const raw = attr.value.replace(/[\\x00-\\x20\\s]+/g, '').toLowerCase();
+                                if (name === 'href') {
+                                    const isSafe = !raw.includes(':') || raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('mailto:') || raw.startsWith('tel:') || raw.startsWith('#') || raw.startsWith('/') || raw.startsWith('./');
+                                    if (!isSafe) el.removeAttribute(attr.name);
+                                } else if (name === 'src') {
+                                    const isSafe = !raw.includes(':') || raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('blob:') || raw.startsWith('data:image/') || raw.startsWith('/') || raw.startsWith('./');
+                                    if (!isSafe) el.removeAttribute(attr.name);
+                                }
+                            }
+                        });
+                    });
+                    return doc.body.innerHTML;
+                } catch (e) {}
+            }
+
+            // Robust String Fallback (decodes HTML entities and validates schemes)
+            let cleaned = String(htmlStr)
+                .replace(/<(script|iframe|object|embed|svg|link|style|meta)[\\s\\S]*?<\\/\\1>/gi, '')
+                .replace(/<(script|iframe|object|embed|svg|link|style|meta)[^>]*\\/?>/gi, '')
+                .replace(/\\s*on[a-zA-Z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '');
+
+            cleaned = cleaned.replace(/(href|src)\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))/gi, function (match, attr, fullVal, v1, v2, v3) {
+                const rawVal = v1 || v2 || v3 || '';
+                const decoded = rawVal.replace(/&#(x[0-9a-f]+|[0-9]+);?/gi, function (_, code) {
+                    const n = code.startsWith('x') || code.startsWith('X') ? parseInt(code.slice(1), 16) : parseInt(code, 10);
+                    return String.fromCharCode(n);
+                }).replace(/&colon;/gi, ':').replace(/[\\x00-\\x20\\s]+/g, '').toLowerCase();
+
+                if (attr.toLowerCase() === 'href') {
+                    const isSafe = !decoded.includes(':') || decoded.startsWith('http://') || decoded.startsWith('https://') || decoded.startsWith('mailto:') || decoded.startsWith('tel:') || decoded.startsWith('#') || decoded.startsWith('/') || decoded.startsWith('./');
+                    return isSafe ? \`\${attr}="\${rawVal}"\` : \`\${attr}="#"\`;
+                } else {
+                    const isSafe = !decoded.includes(':') || decoded.startsWith('http://') || decoded.startsWith('https://') || decoded.startsWith('blob:') || decoded.startsWith('data:image/') || decoded.startsWith('/') || decoded.startsWith('./');
+                    return isSafe ? \`\${attr}="\${rawVal}"\` : '';
+                }
+            });
+            return cleaned;
+        }
+
         function renderActiveMessages(scrollBottom = false) {
             if (!activePeerId) return;
             const target = conversations.find(c => c.peerId === activePeerId);
@@ -684,7 +1392,7 @@ app.get('/', (req, res) => {
 
             messagesArea.innerHTML = target.messages.map(m => {
                 const isSent = m.type === 'sent';
-                let content = m.html || m.text || '';
+                let content = sanitizeClientHtml(m.html || m.text || '');
                 // Fix relative images or audio URLs
                 content = content.replace(/src="(?!(https?:|blob:|data:))\\/?([^"]+)"/g, 'src="https://www.arabic.chat/$2"');
 
@@ -713,11 +1421,57 @@ app.get('/', (req, res) => {
 
 // 2. Status API
 app.get('/api/status', (req, res) => {
+    const isAuthed = checkAuth(req);
+    const isAnySocketConnected = accountSockets.size > 0 ? Array.from(accountSockets.values()).some(e => e.connected) : socketConnected;
+
+    // Public health check response: concise, zero-sensitive metadata
+    if (!isAuthed) {
+        return res.json({
+            ok: true,
+            status: 'online',
+            service: 'ghost-cloud-relay'
+        });
+    }
+
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
     const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]) : [];
+
+    // Per-account status determination
+    const reqOwner = getOwnerId(req);
+    let accountConnected = undefined;
+    let accountLastError = undefined;
+    let accountLastConnectedTime = undefined;
+    let accountLastMessageTime = undefined;
+
+    if (reqOwner && !reqOwner.startsWith('unauthorized_') && reqOwner !== 'default_owner') {
+        const entry = accountSockets.get(reqOwner);
+        if (entry) {
+            accountConnected = !!entry.connected;
+            accountLastError = entry.lastError;
+            accountLastConnectedTime = entry.lastConnectedTime;
+            accountLastMessageTime = entry.lastMessageTime;
+        } else {
+            accountConnected = false;
+            accountLastError = 'Account socket not connected';
+        }
+    }
+
+    const accountsSummary = {};
+    for (const [k, acc] of Object.entries(accountSessions)) {
+        if (!acc.revoked) {
+            const entry = accountSockets.get(k);
+            accountsSummary[k] = {
+                connected: entry ? !!entry.connected : false,
+                lastConnectedTime: entry ? entry.lastConnectedTime : null,
+                lastError: entry ? entry.lastError : null,
+                lastMessageTime: entry ? entry.lastMessageTime : null
+            };
+        }
+    }
+
     res.json({
         ok: true,
-        socketConnected: socketConnected,
+        socketConnected: isAnySocketConnected,
         siteUrl: SITE_URL,
         hasSession: !!(sessionData.utk || sessionData.cookies),
         sessionUtkPresent: !!sessionData.utk,
@@ -727,7 +1481,16 @@ app.get('/api/status', (req, res) => {
         sessionLastUpdated: sessionData.lastUpdated,
         lastConnectedTime: lastConnectedTime,
         lastError: lastError,
+        accountConnected: accountConnected,
+        accountLastError: accountLastError,
+        accountLastConnectedTime: accountLastConnectedTime,
+        accountLastMessageTime: accountLastMessageTime,
+        accounts: accountsSummary,
+        retentionPolicy: 'fifo',
+        maxRetentionMessages: MAX_MESSAGES,
+        currentRetentionCount: messages.length,
         pollerActive: true,
+        storageHealth: storageHealth,
         lastPollTime: lastPollStats.lastPollTime,
         lastPollStatus: lastPollStats.status,
         lastPollCycles: lastPollStats.totalCycles,
@@ -747,25 +1510,33 @@ app.get('/api/logs', requireAuth, (req, res) => {
 
 // 3. Sync Messages (Multi-Device Safe: PC, Kiwi Mobile, PWA)
 app.get('/api/sync', requireAuth, (req, res) => {
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.json({ ok: true, count: 0, messages: [], serverTime: Date.now() });
+    }
     const markAsSynced = req.query.mark === 'true'; // Only mark if explicitly asked
     const getAll = req.query.all !== 'false'; // Default to TRUE so all devices get full sync
     const since = parseInt(req.query.since || '0', 10);
 
+    const ownerMessages = messages.filter(m => Boolean(m.owner) && m.owner === currentOwner);
+
     let resultMsgs = [];
     if (getAll) {
-        resultMsgs = since > 0 ? messages.filter(m => m.timestamp > since) : [...messages];
+        resultMsgs = since > 0 ? ownerMessages.filter(m => m.timestamp > since) : [...ownerMessages];
     } else {
-        resultMsgs = messages.filter(m => !m.synced && (since === 0 || m.timestamp > since));
+        resultMsgs = ownerMessages.filter(m => !m.synced && (since === 0 || m.timestamp > since));
     }
 
     if (markAsSynced && resultMsgs.length > 0) {
-        const idSet = new Set(resultMsgs.map(m => m.id));
-        messages.forEach(m => {
-            if (idSet.has(m.id)) {
-                m.synced = true;
-            }
+        const candidate = messages.map(m => {
+            const shouldMark = resultMsgs.some(rm => isDuplicateMessage(m, rm));
+            return shouldMark ? { ...m, synced: true } : m;
         });
-        saveJson(MESSAGES_FILE, messages);
+        const saved = saveJson(MESSAGES_FILE, candidate);
+        if (!saved) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update sync status' });
+        }
+        messages = candidate;
     }
 
     res.json({
@@ -783,27 +1554,42 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
         return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
     }
 
+    const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
+    }
+    const resolvedOwner = currentOwner;
+
     const sentItem = {
         id: message.id || ('msg_sent_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
-        peerId: String(peerId),
-        name: name || ('مستخدم ' + peerId),
+        peerId: safePeerId,
+        name: name || ('مستخدم ' + safePeerId),
         avatar: message.avatar || 'default_images/avatar/default_avatar.png',
         text: message.text || stripHtml(message.html || ''),
         html: message.html || message.text || '',
         time: message.time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         timestamp: message.timestamp || Date.now(),
         type: 'sent',
-        synced: true
+        synced: true,
+        owner: resolvedOwner
     };
 
-    const exists = messages.some(m => m.id === sentItem.id);
+    if (isPeerTombstoned(resolvedOwner, safePeerId, sentItem.timestamp)) {
+        return res.json({ ok: true, data: sentItem, tombstoned: true });
+    }
+
+    const exists = messages.some(m => isDuplicateMessage(m, sentItem));
     if (!exists) {
-        messages.push(sentItem);
-        if (messages.length > 1000) {
-            messages = messages.slice(-1000);
+        const candidate = [...messages, sentItem];
+        const trimmed = applyRetentionPolicy(candidate);
+        const saved = saveJson(MESSAGES_FILE, trimmed);
+        if (!saved) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
         }
-        saveJson(MESSAGES_FILE, messages);
-        console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message to ${sentItem.name} (${sentItem.peerId})`);
+        messages = trimmed;
+        recordIncomingToPendingTransaction(sentItem);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message (id: ${sentItem.id})`);
     }
 
     res.json({ ok: true, data: sentItem });
@@ -816,36 +1602,182 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
         return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
     }
 
+    const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
+    }
+
     const incomingItem = {
         id: message.id || ('msg_in_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
-        peerId: String(peerId),
-        name: name || ('مستخدم ' + peerId),
+        peerId: safePeerId,
+        name: name || ('مستخدم ' + safePeerId),
         avatar: message.avatar || 'default_images/avatar/default_avatar.png',
         text: message.text || stripHtml(message.html || ''),
         html: message.html || message.text || '',
         time: message.time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         timestamp: message.timestamp || Date.now(),
         type: 'received',
-        synced: true // Already handled by the reporting extension
+        synced: true, // Already handled by the reporting extension
+        owner: currentOwner
     };
 
-    const exists = messages.some(m => m.id === incomingItem.id || (m.peerId === incomingItem.peerId && m.type === 'received' && m.text && incomingItem.text && m.text === incomingItem.text && Math.abs((m.timestamp || 0) - (incomingItem.timestamp || 0)) < 3000));
+    if (isPeerTombstoned(currentOwner, safePeerId, incomingItem.timestamp)) {
+        return res.json({ ok: true, data: incomingItem, tombstoned: true });
+    }
+
+    const exists = messages.some(m => isDuplicateMessage(m, incomingItem));
     if (!exists) {
-        messages.push(incomingItem);
-        if (messages.length > 1500) {
-            messages = messages.slice(-1500);
+        const candidate = [...messages, incomingItem];
+        const trimmed = applyRetentionPolicy(candidate);
+        const saved = saveJson(MESSAGES_FILE, trimmed);
+        if (!saved) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
         }
-        saveJson(MESSAGES_FILE, messages);
-        console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message from ${incomingItem.name} (${incomingItem.peerId})`);
+        messages = trimmed;
+        recordIncomingToPendingTransaction(incomingItem);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message (id: ${incomingItem.id})`);
     }
 
     res.json({ ok: true, data: incomingItem });
 });
 
+// 4.1 Delete Peer Messages API (For Tombstone / Contact Deletion Sync)
+app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
+    const { peerId, beforeTimestamp } = req.body;
+    if (!peerId) {
+        return res.status(400).json({ ok: false, error: 'Missing peerId parameter' });
+    }
+    const cutoff = Number(beforeTimestamp);
+    if (!cutoff || isNaN(cutoff) || cutoff <= 0) {
+        return res.status(400).json({ ok: false, error: 'Missing or invalid beforeTimestamp cutoff parameter' });
+    }
+    const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
+    }
+
+    // Reject deletion if an uncommitted transaction is pending on disk
+    if (fs.existsSync(TRANSACTION_FILE)) {
+        const existingTx = loadJson(TRANSACTION_FILE, null);
+        if (existingTx && existingTx.status && existingTx.status !== 'committed') {
+            return res.status(503).json({
+                ok: false,
+                error: 'Cannot process deletion: an uncommitted transaction is pending recovery',
+                storageHealth
+            });
+        }
+    }
+
+    // Persist permanent deletion cutoff tombstone for this owner and peer
+    const cutoffKey = `${currentOwner}:${safePeerId}`;
+    const existingCutoff = Number(deletionCutoffs[cutoffKey] || 0);
+    const updatedCutoffs = { ...deletionCutoffs };
+    let cutoffsChanged = false;
+    if (cutoff > existingCutoff) {
+        updatedCutoffs[cutoffKey] = cutoff;
+        cutoffsChanged = true;
+    }
+
+    const snapshotMessages = [...messages];
+    const snapshotCutoffs = { ...deletionCutoffs };
+
+    // Transaction journal for atomic deletion
+    const txId = 'tx_del_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const txRecord = {
+        id: txId,
+        type: 'delete_peer',
+        status: 'pending',
+        timestamp: new Date().toISOString(),
+        previous: {
+            deletionCutoffs: snapshotCutoffs,
+            messages: snapshotMessages
+        }
+    };
+    const savedTx = saveJson(TRANSACTION_FILE, txRecord);
+    if (!savedTx) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to create deletion transaction journal' });
+    }
+
+    if (cutoffsChanged) {
+        const cutoffsSaved = saveJson(DELETION_CUTOFFS_FILE, updatedCutoffs);
+        if (!cutoffsSaved) {
+            try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+            return res.status(500).json({ ok: false, error: 'Persistence failure while saving deletion cutoff tombstone' });
+        }
+        deletionCutoffs = updatedCutoffs;
+    }
+
+    const beforeCount = messages.length;
+    const filtered = messages.filter(m => {
+        const isTarget = String(m.peerId) === safePeerId && (m.owner === currentOwner);
+        if (!isTarget) return true;
+        return (Number(m.timestamp) || 0) > cutoff;
+    });
+    const saved = saveJson(MESSAGES_FILE, filtered);
+    if (!saved) {
+        if (cutoffsChanged) {
+            saveJson(DELETION_CUTOFFS_FILE, snapshotCutoffs);
+            deletionCutoffs = snapshotCutoffs;
+        }
+        try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+        return res.status(500).json({ ok: false, error: 'Persistence failure while deleting peer messages' });
+    }
+    messages = filtered;
+
+    let committed = false;
+    try {
+        if (fs.existsSync(TRANSACTION_FILE)) {
+            fs.unlinkSync(TRANSACTION_FILE);
+        }
+        committed = true;
+    } catch (unlinkErr) {
+        console.error('[Transaction] Failed to unlink transaction journal after delete:', unlinkErr.message);
+    }
+    if (!committed) {
+        try {
+            txRecord.status = 'committed';
+            if (saveJson(TRANSACTION_FILE, txRecord)) {
+                committed = true;
+            }
+        } catch (_) {}
+    }
+
+    if (!committed) {
+        // Rollback memory and disk state to prevent false success on uncommitted journal
+        if (cutoffsChanged) {
+            saveJson(DELETION_CUTOFFS_FILE, snapshotCutoffs);
+            deletionCutoffs = snapshotCutoffs;
+        }
+        saveJson(MESSAGES_FILE, snapshotMessages);
+        messages = snapshotMessages;
+        storageHealth = {
+            ok: false,
+            error: 'Commit journal finalization failure on delete: unable to clear or commit journal on disk',
+            lastIncident: new Date().toISOString()
+        };
+        return res.status(500).json({
+            ok: false,
+            error: 'Persistence failure: delete transaction could not be safely committed on disk',
+            storageHealth
+        });
+    }
+    storageHealth = { ok: true, error: null, lastIncident: null };
+
+    console.log(`[Ghost Cloud] Deleted ${beforeCount - messages.length} messages for peer ${safePeerId} (cutoff: ${cutoff})`);
+    res.json({ ok: true, deleted: beforeCount - messages.length, cutoff });
+});
+
 // 5. Get Full Conversations (For Mobile Web Viewer)
 app.get('/api/conversations', requireAuth, (req, res) => {
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.json({ ok: true, count: 0, conversations: [] });
+    }
+    const ownerMessages = messages.filter(m => Boolean(m.owner) && m.owner === currentOwner);
     const map = {};
-    messages.forEach(m => {
+    ownerMessages.forEach(m => {
         if (!map[m.peerId]) {
             map[m.peerId] = {
                 peerId: m.peerId,
@@ -884,58 +1816,690 @@ app.get('/api/conversations', requireAuth, (req, res) => {
     res.json({ ok: true, count: convs.length, conversations: convs });
 });
 
+function performRevocation(req, res) {
+    const clientToken = (req.headers && req.headers['x-ghost-token']) ||
+                        (req.body && (req.body.existingToken || req.body.sessionToken || req.body.token)) ||
+                        (req.query && (req.query.sessionToken || req.query.token));
+
+    let targetKey = null;
+    if (clientToken && typeof clientToken === 'string' && clientToken.trim()) {
+        const cleanToken = clientToken.trim();
+        for (const [key, acc] of Object.entries(accountSessions)) {
+            if (acc.utk === cleanToken || (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)) || (Array.isArray(acc.historicUtks) && acc.historicUtks.includes(cleanToken))) {
+                targetKey = key;
+                break;
+            }
+        }
+        if (!targetKey) {
+            return res.status(401).json({ ok: false, error: 'Unauthorized: invalid account token for revocation' });
+        }
+    } else {
+        // Tokenless revocation: only permitted if at most 1 active account exists AND has NO stored messages or explicit user identity
+        const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
+
+        const anyHasDataOrIdentity = activeEntries.some(([k, acc]) => {
+            const hasMsgs = messages.some(m => Boolean(m.owner) && m.owner === k);
+            const hasExplicitId = Boolean(extractExplicitUserId(acc.cookies));
+            return hasMsgs || hasExplicitId;
+        }) || (sessionData && Boolean(extractExplicitUserId(sessionData.cookies)));
+
+        if (activeEntries.length > 1 || anyHasDataOrIdentity) {
+            return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required to revoke an account with stored data or identity' });
+        } else if (activeEntries.length === 1) {
+            targetKey = activeEntries[0][0];
+        }
+    }
+
+    if (targetKey && accountSessions[targetKey]) {
+        const acc = accountSessions[targetKey];
+        const hasDataOrIdentity = messages.some(m => Boolean(m.owner) && m.owner === targetKey) ||
+                                  Boolean(extractExplicitUserId(acc.cookies)) ||
+                                  (Array.isArray(acc.utks) && acc.utks.length > 0) ||
+                                  (Array.isArray(acc.historicUtks) && acc.historicUtks.length > 0);
+
+        if (hasDataOrIdentity) {
+            acc.revoked = true;
+            acc.revokedAt = new Date().toISOString();
+            if (!Array.isArray(acc.historicUtks)) {
+                acc.historicUtks = [];
+            }
+            if (Array.isArray(acc.utks)) {
+                for (const t of acc.utks) {
+                    if (t && !acc.historicUtks.includes(t)) {
+                        acc.historicUtks.push(t);
+                    }
+                }
+            }
+            if (acc.utk && !acc.historicUtks.includes(acc.utk)) {
+                acc.historicUtks.push(acc.utk);
+            }
+            if (!Array.isArray(acc.historicCookies)) {
+                acc.historicCookies = [];
+            }
+            if (acc.cookies && !acc.historicCookies.includes(acc.cookies)) {
+                acc.historicCookies.push(acc.cookies);
+            }
+            if (!Array.isArray(acc.historicPhpSessids)) {
+                acc.historicPhpSessids = [];
+            }
+            const phpMatch = (acc.cookies || '').match(/PHPSESSID=([^;]+)/i);
+            if (phpMatch && !acc.historicPhpSessids.includes(phpMatch[1].trim())) {
+                acc.historicPhpSessids.push(phpMatch[1].trim());
+            }
+            acc.utks = [];
+            acc.utk = '';
+            acc.cookies = '';
+            acc.lastUpdated = new Date().toISOString();
+        } else {
+            delete accountSessions[targetKey];
+        }
+
+        if (targetKey) {
+            disconnectAccountSocket(targetKey);
+        }
+        const savedAcc = saveJson(ACCOUNTS_FILE, accountSessions);
+        if (!savedAcc) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update accounts file' });
+        }
+    }
+
+    // Adjust active server sessionData
+    const currentSessionKey = sessionData ? extractStableAccountId(sessionData.cookies, sessionData.utk) : null;
+    if (!sessionData) {
+        sessionData = { cookies: '', utk: '', userAgent: '', lastUpdated: new Date().toISOString() };
+    } else if (currentSessionKey === targetKey || !targetKey || Object.values(accountSessions).filter(a => !a.revoked).length === 0) {
+        const remaining = Object.values(accountSessions).filter(a => !a.revoked && (a.utk || a.cookies));
+        if (remaining.length > 0) {
+            sessionData.cookies = remaining[0].cookies || '';
+            sessionData.utk = remaining[0].utk || '';
+            sessionData.userAgent = remaining[0].userAgent || '';
+            sessionData.lastUpdated = new Date().toISOString();
+        } else {
+            sessionData.cookies = '';
+            sessionData.utk = '';
+            sessionData.lastUpdated = new Date().toISOString();
+        }
+    }
+
+    if (!sessionData.utk && !sessionData.cookies) {
+        for (const k of Array.from(accountSockets.keys())) {
+            disconnectAccountSocket(k);
+        }
+        chatSocket = null;
+        socketConnected = false;
+    }
+
+    const savedSession = saveJson(SESSION_FILE, sessionData);
+    if (!savedSession) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write session file' });
+    }
+
+    const remainingActiveCount = Object.values(accountSessions).filter(a => !a.revoked).length;
+    addLog(`[API] Session revoked/logged out for account ${targetKey || 'all'}. Remaining active accounts: ${remainingActiveCount}`);
+    return res.json({
+        ok: true,
+        revoked: true,
+        accountKey: targetKey,
+        remainingAccounts: remainingActiveCount
+    });
+}
+
+// 5.1 Logout API (Explicit endpoint to revoke session & expire credentials)
+app.post('/api/logout', requireAuth, (req, res) => {
+    return performRevocation(req, res);
+});
+app.post('/api/session/logout', requireAuth, (req, res) => {
+    return performRevocation(req, res);
+});
+
 // 6. Update Session / Cookies (Called automatically by Extension on page visit)
 app.post('/api/session', requireAuth, (req, res) => {
-    const { cookies, utk, userAgent } = req.body;
-    let changed = false;
-
-    if (cookies) {
-        // Smart Cookie Merge: preserve existing PHPSESSID if incoming string doesn't supply one
-        const cookieMap = new Map();
-        if (sessionData.cookies) {
-            sessionData.cookies.split(';').forEach(pair => {
-                const parts = pair.trim().split('=');
-                if (parts[0]) cookieMap.set(parts[0], parts.slice(1).join('='));
+    // If storage is degraded from a previous failed transaction or startup recovery, attempt reconciliation before accepting mutations
+    if (storageHealth && !storageHealth.ok) {
+        if (fs.existsSync(TRANSACTION_FILE)) {
+            try {
+                const tx = loadJson(TRANSACTION_FILE, null);
+                if (tx && tx.status && tx.status !== 'committed' && tx.previous) {
+                    let allRestored = true;
+                    if (tx.previous.deletionCutoffs && !saveJson(DELETION_CUTOFFS_FILE, tx.previous.deletionCutoffs)) allRestored = false;
+                    if (tx.previous.accounts && !saveJson(ACCOUNTS_FILE, tx.previous.accounts)) allRestored = false;
+                    if (tx.previous.messages) {
+                        const currentDiskMessages = loadJson(MESSAGES_FILE, messages || []);
+                        const mergedMessages = reconcileRecoveredMessagesList(tx.previous.messages, currentDiskMessages);
+                        if (saveJson(MESSAGES_FILE, mergedMessages)) {
+                            messages = mergedMessages;
+                        } else {
+                            allRestored = false;
+                        }
+                    }
+                    if (tx.previous.session && !saveJson(SESSION_FILE, tx.previous.session)) allRestored = false;
+                    if (allRestored) {
+                        try { fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+                        if (tx.previous.deletionCutoffs) deletionCutoffs = tx.previous.deletionCutoffs;
+                        accountSessions = tx.previous.accounts || accountSessions;
+                        sessionData = tx.previous.session || sessionData;
+                        storageHealth = { ok: true, error: null, lastIncident: null };
+                    }
+                }
+            } catch (_) {}
+        }
+        if (storageHealth && !storageHealth.ok) {
+            return res.status(503).json({
+                ok: false,
+                error: 'Storage degraded: cannot accept session modifications until storage recovery succeeds',
+                storageHealth
             });
         }
-        cookies.split(';').forEach(pair => {
-            const parts = pair.trim().split('=');
-            if (parts[0]) cookieMap.set(parts[0], parts.slice(1).join('='));
+    }
+
+    // Immediately reject if an uncommitted transaction is pending on disk (even if storageHealth.ok is true)
+    // or if storage is currently degraded. Evaluated BEFORE any in-memory state inspection or mutation.
+    if (fs.existsSync(TRANSACTION_FILE)) {
+        const existingTx = loadJson(TRANSACTION_FILE, null);
+        if (existingTx && existingTx.status && existingTx.status !== 'committed') {
+            return res.status(503).json({
+                ok: false,
+                error: 'Cannot update session: an uncommitted transaction is pending recovery',
+                storageHealth
+            });
+        }
+    }
+    if (storageHealth && !storageHealth.ok) {
+        return res.status(503).json({
+            ok: false,
+            error: 'Cannot update session: storage is currently degraded: ' + (storageHealth.error || 'unspecified'),
+            storageHealth
         });
+    }
 
-        const mergedCookies = Array.from(cookieMap.entries())
-            .map(([k, v]) => `${k}=${v}`)
-            .join('; ');
+    const { cookies, utk, userAgent } = req.body;
+    const prevSession = sessionData ? { ...sessionData } : null;
 
-        if (mergedCookies !== sessionData.cookies) {
-            sessionData.cookies = mergedCookies;
+    const candidateUtk = utk !== undefined ? (typeof utk === 'string' ? utk.trim() : '') : (prevSession ? prevSession.utk : '');
+    const candidateUserAgent = userAgent !== undefined ? userAgent : (prevSession ? prevSession.userAgent : '');
+
+    let candidateCookies = '';
+    if (cookies !== undefined) {
+        candidateCookies = typeof cookies === 'string' ? cookies.trim() : '';
+    } else {
+        // If cookies not provided: ONLY inherit if candidateUtk belongs to an existing account, or matches prevSession.utk
+        let foundAccForUtk = null;
+        if (candidateUtk) {
+            for (const [k, acc] of Object.entries(accountSessions)) {
+                if (acc && !acc.revoked && (acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk)))) {
+                    foundAccForUtk = acc;
+                    break;
+                }
+            }
+        }
+        if (foundAccForUtk) {
+            candidateCookies = foundAccForUtk.cookies || '';
+        } else if (prevSession && (!candidateUtk || candidateUtk === prevSession.utk)) {
+            candidateCookies = prevSession.cookies || '';
+        } else {
+            // New/different token without cookies: DO NOT inherit prior account cookies!
+            candidateCookies = '';
+        }
+    }
+
+    const accKey = extractStableAccountId(candidateCookies, candidateUtk);
+
+    const isRevocation = (cookies !== undefined || utk !== undefined) && !candidateCookies && !candidateUtk;
+    if (isRevocation) {
+        return performRevocation(req, res);
+    }
+
+    // Cross-Account Token Mismatch Protection (F3):
+    // A token actively bound to one account cannot be claimed or hijacked by a different user account
+    if (candidateUtk && accKey) {
+        for (const [k, acc] of Object.entries(accountSessions)) {
+            if (k !== accKey && acc && !acc.revoked) {
+                const ownsActive = acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk));
+                if (ownsActive) {
+                    const ownerUserId = extractExplicitUserId(acc.cookies);
+                    const currentUserId = extractExplicitUserId(candidateCookies);
+                    if (ownerUserId && currentUserId && ownerUserId !== currentUserId) {
+                        return res.status(409).json({
+                            ok: false,
+                            error: `Conflict: token "${candidateUtk}" is actively bound to account ${k}; cross-account token transfer between different users is prohibited`
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 1. Authorization & Anti-Hijacking Check: BEFORE TOUCHING DISK OR MEMORY
+    // If accKey is already registered with existing tokens (active or historic/tombstoned),
+    // enrolling a NEW token requires proving ownership of the account.
+    // If the account was revoked, revoked tokens and expired session data are expired for all purposes and cannot authorize recovery.
+    // An independent recovery credential (account recoveryKey or admin key) is required.
+    if (accKey && accountSessions[accKey]) {
+        const acc = accountSessions[accKey];
+        const historicTokens = Array.isArray(acc.historicUtks) ? acc.historicUtks : [];
+        const historicCookies = Array.isArray(acc.historicCookies) ? acc.historicCookies : [];
+        const historicPhpSessids = Array.isArray(acc.historicPhpSessids) ? acc.historicPhpSessids : [];
+        const activeTokens = Array.isArray(acc.utks) ? acc.utks : [];
+        if (acc.utk && !activeTokens.includes(acc.utk) && !acc.revoked) {
+            activeTokens.push(acc.utk);
+        }
+
+        const reqToken = (req.headers && req.headers['x-ghost-token']) ||
+                         (req.body && (req.body.existingToken || req.body.sessionToken));
+        const cleanReqToken = reqToken ? String(reqToken).trim() : null;
+
+        const clientRecoveryKey = (req.headers && (req.headers['x-ghost-recovery-key'] || req.headers['x-ghost-admin-key'])) ||
+                                 (req.body && (req.body.recoveryKey || req.body.adminKey)) ||
+                                 (req.query && (req.query.recoveryKey || req.query.adminKey));
+        const cleanRecoveryKey = clientRecoveryKey ? String(clientRecoveryKey).trim() : null;
+
+        const adminKey = getAdminRecoveryKey();
+        const isRecoveryAuthorized = Boolean(cleanRecoveryKey && (
+            (acc.recoveryKey && cleanRecoveryKey === acc.recoveryKey) ||
+            (adminKey && cleanRecoveryKey === adminKey)
+        ));
+
+        if (acc.revoked) {
+            // Case 1: Re-enrolling a REVOKED account
+            // 1. Revoked session tokens are completely expired for all purposes.
+            //    Presenting a revoked historical token as proof (in existingToken or x-ghost-token) is strictly rejected.
+            if (cleanReqToken && historicTokens.includes(cleanReqToken)) {
+                return res.status(403).json({
+                    ok: false,
+                    error: 'Forbidden: revoked session token cannot authorize account recovery or replacement. Independent recovery credential required.'
+                });
+            }
+
+            // 2. A revoked historical token can NEVER reactivate itself as an account token.
+            //    The new candidate token must be different from all revoked/historical tokens.
+            if (candidateUtk && historicTokens.includes(candidateUtk)) {
+                return res.status(403).json({
+                    ok: false,
+                    error: 'Forbidden: revoked token is expired for all purposes and cannot reactivate itself as an account token'
+                });
+            }
+
+            // 3. Expired session cookies cannot authorize recovery or grant authority.
+            const candidatePhp = (candidateCookies || '').match(/PHPSESSID=([^;]+)/i);
+            if (candidatePhp && historicPhpSessids.includes(candidatePhp[1].trim()) && !isRecoveryAuthorized) {
+                return res.status(403).json({
+                    ok: false,
+                    error: 'Forbidden: expired session cookie from revoked session cannot authorize account recovery'
+                });
+            }
+
+            // 4. Re-enrolling or recovering a revoked account strictly requires independent recovery authorization.
+            if (!candidateUtk || !isRecoveryAuthorized) {
+                return res.status(403).json({
+                    ok: false,
+                    error: 'Forbidden: re-enrolling a revoked account requires independent recovery authorization (recoveryKey or adminKey)'
+                });
+            }
+        } else {
+            // Case 2: ACTIVE account
+            // 1. If candidateUtk is already one of the active tokens, it's an authenticated refresh/update.
+            const isExistingActiveToken = candidateUtk && activeTokens.includes(candidateUtk);
+
+            // 2. If enrolling a new token for an active account:
+            //    - The candidate token cannot be an old revoked/historic token.
+            if (candidateUtk && historicTokens.includes(candidateUtk) && !isExistingActiveToken) {
+                return res.status(403).json({ ok: false, error: 'Forbidden: historic token cannot be reused as active token' });
+            }
+
+            //    - A historic/revoked token cannot authorize new token enrollment.
+            if (cleanReqToken && historicTokens.includes(cleanReqToken) && !activeTokens.includes(cleanReqToken)) {
+                return res.status(403).json({
+                    ok: false,
+                    error: 'Forbidden: revoked session token cannot authorize new token enrollment. Active account token or independent recovery credential required.'
+                });
+            }
+
+            //    - The client must prove ownership using one of the current active tokens OR recovery authorization.
+            const hasProvenActiveToken = cleanReqToken && activeTokens.includes(cleanReqToken);
+
+            if (activeTokens.length > 0 && !isExistingActiveToken && !hasProvenActiveToken && !isRecoveryAuthorized) {
+                return res.status(403).json({ ok: false, error: 'Forbidden: existing account token required to enroll new token for this account' });
+            }
+        }
+    }
+
+    let changed = false;
+    if (!sessionData) {
+        changed = true;
+    } else {
+        if (candidateCookies !== sessionData.cookies) {
+            changed = true;
+        }
+        if (candidateUtk !== sessionData.utk) {
+            changed = true;
+        }
+        if (candidateUserAgent !== sessionData.userAgent) {
             changed = true;
         }
     }
-    if (utk && utk !== sessionData.utk) {
-        sessionData.utk = utk;
-        changed = true;
-    }
-    if (userAgent && userAgent !== sessionData.userAgent) {
-        sessionData.userAgent = userAgent;
-        changed = true;
-    }
 
-    sessionData.lastUpdated = new Date().toISOString();
-    saveJson(SESSION_FILE, sessionData);
+    if (changed) {
+        // Deep clone snapshots of in-memory states before making mutations
+        const snapshotSessionData = prevSession ? JSON.parse(JSON.stringify(prevSession)) : null;
+        const snapshotAccountSessions = JSON.parse(JSON.stringify(accountSessions));
+        const snapshotMessages = JSON.parse(JSON.stringify(messages));
+
+        sessionData = {
+            cookies: candidateCookies,
+            utk: candidateUtk,
+            userAgent: candidateUserAgent,
+            lastUpdated: new Date().toISOString()
+        };
+
+        // 1. Prepare in-memory updates for accountSessions & messages
+        let migrated = false;
+        if (accKey) {
+            const prevAccKey = prevSession ? extractStableAccountId(prevSession.cookies, prevSession.utk) : null;
+            const prevUserId = prevSession ? extractExplicitUserId(prevSession.cookies) : null;
+            const currentUserId = extractExplicitUserId(sessionData.cookies);
+            const isDifferentUser = Boolean(prevUserId && currentUserId && prevUserId !== currentUserId);
+
+            const isSameAccountRenewal = Boolean(prevSession && prevSession.utk && sessionData.utk &&
+                                         prevSession.utk === sessionData.utk && prevAccKey && prevAccKey !== accKey && !isDifferentUser);
+
+            const clientRecoveryKey = (req.headers && (req.headers['x-ghost-recovery-key'] || req.headers['x-ghost-admin-key'])) ||
+                                     (req.body && (req.body.recoveryKey || req.body.adminKey)) ||
+                                     (req.query && (req.query.recoveryKey || req.query.adminKey));
+            const cleanRecoveryKey = clientRecoveryKey ? String(clientRecoveryKey).trim() : null;
+
+            let renewalSourceKey = null;
+            if (isSameAccountRenewal) {
+                if (prevAccKey && accountSessions[prevAccKey]) {
+                    renewalSourceKey = prevAccKey;
+                } else {
+                    for (const [k, acc] of Object.entries(accountSessions)) {
+                        if (!acc.revoked && (
+                            (sessionData.utk && (acc.utk === sessionData.utk || (Array.isArray(acc.utks) && acc.utks.includes(sessionData.utk)))) ||
+                            (Array.isArray(acc.legacyKeys) && acc.legacyKeys.includes(prevAccKey)) ||
+                            (prevSession && prevSession.cookies && acc.cookies === prevSession.cookies) ||
+                            (prevSession && prevSession.utk && acc.utk === prevSession.utk)
+                        )) {
+                            renewalSourceKey = k;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (isSameAccountRenewal && renewalSourceKey && accountSessions[renewalSourceKey]) {
+                accountSessions[accKey] = accountSessions[renewalSourceKey];
+                accountSessions[accKey].accountKey = accKey;
+                accountSessions[accKey].cookies = sessionData.cookies;
+                accountSessions[accKey].utk = sessionData.utk;
+                accountSessions[accKey].userAgent = sessionData.userAgent;
+                accountSessions[accKey].lastUpdated = sessionData.lastUpdated;
+                accountSessions[accKey].revoked = false;
+                if (!accountSessions[accKey].recoveryKey) {
+                    accountSessions[accKey].recoveryKey = generateRecoveryKey();
+                }
+                if (!Array.isArray(accountSessions[accKey].utks)) accountSessions[accKey].utks = [];
+                if (!Array.isArray(accountSessions[accKey].historicUtks)) accountSessions[accKey].historicUtks = [];
+                if (!Array.isArray(accountSessions[accKey].legacyKeys)) accountSessions[accKey].legacyKeys = [];
+                if (renewalSourceKey !== accKey && !accountSessions[accKey].legacyKeys.includes(renewalSourceKey)) {
+                    accountSessions[accKey].legacyKeys.push(renewalSourceKey);
+                }
+                if (prevAccKey && prevAccKey !== accKey && !accountSessions[accKey].legacyKeys.includes(prevAccKey)) {
+                    accountSessions[accKey].legacyKeys.push(prevAccKey);
+                }
+                if (sessionData.utk) {
+                    if (!accountSessions[accKey].utks.includes(sessionData.utk)) {
+                        accountSessions[accKey].utks.push(sessionData.utk);
+                    }
+                    if (!accountSessions[accKey].historicUtks.includes(sessionData.utk)) {
+                        accountSessions[accKey].historicUtks.push(sessionData.utk);
+                    }
+                }
+                if (renewalSourceKey !== accKey) {
+                    delete accountSessions[renewalSourceKey];
+                }
+            } else if (!accountSessions[accKey]) {
+                accountSessions[accKey] = {
+                    accountKey: accKey,
+                    cookies: sessionData.cookies,
+                    utk: sessionData.utk,
+                    userAgent: sessionData.userAgent,
+                    utks: [sessionData.utk].filter(Boolean),
+                    historicUtks: [sessionData.utk].filter(Boolean),
+                    recoveryKey: generateRecoveryKey(),
+                    revoked: false,
+                    lastUpdated: sessionData.lastUpdated
+                };
+            } else {
+                accountSessions[accKey].revoked = false;
+                accountSessions[accKey].cookies = sessionData.cookies;
+                accountSessions[accKey].utk = sessionData.utk;
+                accountSessions[accKey].userAgent = sessionData.userAgent;
+                accountSessions[accKey].lastUpdated = sessionData.lastUpdated;
+                if (!accountSessions[accKey].recoveryKey) {
+                    accountSessions[accKey].recoveryKey = generateRecoveryKey();
+                } else if (req.body.newRecoveryKey) {
+                    accountSessions[accKey].recoveryKey = String(req.body.newRecoveryKey).trim();
+                }
+                if (!Array.isArray(accountSessions[accKey].utks)) accountSessions[accKey].utks = [];
+                if (!Array.isArray(accountSessions[accKey].historicUtks)) accountSessions[accKey].historicUtks = [];
+                if (sessionData.utk) {
+                    if (!accountSessions[accKey].utks.includes(sessionData.utk)) {
+                        accountSessions[accKey].utks.push(sessionData.utk);
+                    }
+                    if (!accountSessions[accKey].historicUtks.includes(sessionData.utk)) {
+                        accountSessions[accKey].historicUtks.push(sessionData.utk);
+                    }
+                }
+            }
+
+            // Disassociate this token from any other account to maintain unique token mapping
+            if (sessionData.utk) {
+                for (const [key, acc] of Object.entries(accountSessions)) {
+                    if (key !== accKey && Array.isArray(acc.utks)) {
+                        acc.utks = acc.utks.filter(t => t !== sessionData.utk);
+                        if (acc.utk === sessionData.utk) {
+                            acc.utk = acc.utks[0] || '';
+                        }
+                    }
+                }
+            }
+
+            // Safe Migration:
+            // 1. If same account renewal (same UTK with rotated PHPSESSID), migrate from prevAccKey, renewalSourceKey, or legacy keys to accKey.
+            // 2. If message is owned by current account's registered UTK(s), migrate to accKey.
+            // NEVER migrate messages if the user ID changed (C to D)!
+            const isAccountUtk = mOwner => (mOwner === sessionData.utk || (Array.isArray(accountSessions[accKey].utks) && accountSessions[accKey].utks.includes(mOwner))) &&
+                                          mOwner !== accKey && !isDifferentUser;
+            const isRenewalOwner = mOwner => Boolean(
+                isSameAccountRenewal && mOwner && (
+                    mOwner === prevAccKey ||
+                    mOwner === renewalSourceKey ||
+                    (accountSessions[accKey].legacyKeys && accountSessions[accKey].legacyKeys.includes(mOwner)) ||
+                    (prevSession && prevSession.cookies && mOwner === prevSession.cookies.match(/PHPSESSID=([^;]+)/i)?.[1]?.trim()) ||
+                    (prevSession && prevSession.utk && mOwner === prevSession.utk)
+                )
+            );
+            messages.forEach(m => {
+                if (m.owner) {
+                    if (isRenewalOwner(m.owner)) {
+                        m.owner = accKey;
+                        migrated = true;
+                    } else if (isAccountUtk(m.owner)) {
+                        m.owner = accKey;
+                        migrated = true;
+                    }
+                }
+            });
+
+            // Write transaction journal to disk to guarantee recoverability across restarts BEFORE touching ANY state files!
+            const txRecord = {
+                id: 'tx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+                status: 'pending',
+                timestamp: Date.now(),
+                accKey: accKey,
+                previous: {
+                    accounts: snapshotAccountSessions,
+                    messages: snapshotMessages,
+                    session: snapshotSessionData
+                }
+            };
+            const savedTx = saveJson(TRANSACTION_FILE, txRecord);
+            if (!savedTx) {
+                // Journal write failed! Abort before touching ANY state files on disk!
+                sessionData = snapshotSessionData;
+                accountSessions = snapshotAccountSessions;
+                messages = snapshotMessages;
+                storageHealth = {
+                    ok: false,
+                    error: 'Transaction aborted: unable to write transaction journal to disk',
+                    lastIncident: new Date().toISOString()
+                };
+                return res.status(500).json({
+                    ok: false,
+                    error: 'Persistence failure: unable to write transaction journal',
+                    storageHealth
+                });
+            }
+
+            // 2. Persist ACCOUNTS_FILE FIRST!
+            // If writing accounts fails, session.json and messages.json on disk were never touched.
+            const savedAcc = saveJson(ACCOUNTS_FILE, accountSessions);
+            if (!savedAcc) {
+                try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+                sessionData = snapshotSessionData;
+                accountSessions = snapshotAccountSessions;
+                messages = snapshotMessages;
+                return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write accounts file' });
+            }
+
+            // 3. Persist MESSAGES_FILE SECOND if migrated
+            if (migrated) {
+                const savedMessages = saveJson(MESSAGES_FILE, messages);
+                if (!savedMessages) {
+                    // Rollback accounts file on disk
+                    const rolledBack = saveJson(ACCOUNTS_FILE, snapshotAccountSessions);
+                    sessionData = snapshotSessionData;
+                    accountSessions = snapshotAccountSessions;
+                    messages = snapshotMessages;
+                    if (!rolledBack) {
+                        storageHealth = {
+                            ok: false,
+                            error: 'Multi-file rollback failure: accounts.json could not be restored and is desynchronized until recovery/restart',
+                            lastIncident: new Date().toISOString()
+                        };
+                        txRecord.status = 'rollback_failed';
+                        const savedTxStatus = saveJson(TRANSACTION_FILE, txRecord);
+                        if (!savedTxStatus) {
+                            console.error('[Transaction] Failed to update transaction status to rollback_failed');
+                        }
+                        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file and accounts rollback failed', storageHealth });
+                    }
+                    try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+                    return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
+                }
+            }
+        }
+
+        // 4. Persist SESSION_FILE LAST!
+        const saved = saveJson(SESSION_FILE, sessionData);
+        if (!saved) {
+            let rollbackFailed = false;
+            if (accKey) {
+                // Rollback accounts file on disk
+                if (!saveJson(ACCOUNTS_FILE, snapshotAccountSessions)) rollbackFailed = true;
+                if (migrated) {
+                    if (!saveJson(MESSAGES_FILE, snapshotMessages)) rollbackFailed = true;
+                }
+            }
+            sessionData = snapshotSessionData;
+            accountSessions = snapshotAccountSessions;
+            messages = snapshotMessages;
+            if (rollbackFailed) {
+                storageHealth = {
+                    ok: false,
+                    error: 'Multi-file rollback failure: files could not be restored and are desynchronized until recovery/restart',
+                    lastIncident: new Date().toISOString()
+                };
+                if (typeof txRecord !== 'undefined') {
+                    txRecord.status = 'rollback_failed';
+                    const savedTxStatus = saveJson(TRANSACTION_FILE, txRecord);
+                    if (!savedTxStatus) {
+                        console.error('[Transaction] Failed to update transaction status to rollback_failed');
+                    }
+                }
+                return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write session file and rollback failed', storageHealth });
+            }
+            try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write session file' });
+        }
+
+        // Transaction successfully committed! Clear journal and reset storage health
+        let committed = false;
+        try {
+            if (fs.existsSync(TRANSACTION_FILE)) {
+                fs.unlinkSync(TRANSACTION_FILE);
+            }
+            committed = true;
+        } catch (unlinkErr) {
+            console.error('[Transaction] Failed to unlink transaction journal after commit:', unlinkErr.message);
+        }
+        if (!committed) {
+            try {
+                if (typeof txRecord !== 'undefined') {
+                    txRecord.status = 'committed';
+                    if (saveJson(TRANSACTION_FILE, txRecord)) {
+                        committed = true;
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (!committed) {
+            // Failed both to unlink journal and to mark committed!
+            // Revert state on disk and in memory to prevent false success.
+            if (accKey) {
+                saveJson(ACCOUNTS_FILE, snapshotAccountSessions);
+                if (migrated) saveJson(MESSAGES_FILE, snapshotMessages);
+            }
+            saveJson(SESSION_FILE, snapshotSessionData);
+            sessionData = snapshotSessionData;
+            accountSessions = snapshotAccountSessions;
+            messages = snapshotMessages;
+            storageHealth = {
+                ok: false,
+                error: 'Commit journal finalization failure: unable to clear or commit journal on disk',
+                lastIncident: new Date().toISOString()
+            };
+            return res.status(500).json({
+                ok: false,
+                error: 'Persistence failure: transaction could not be safely committed on disk',
+                storageHealth
+            });
+        }
+        storageHealth = { ok: true, error: null, lastIncident: null };
+
+        const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
+        addLog(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp ? 'YES' : 'NO'}). Reconnecting socket...`);
+        console.log(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp}). Reconnecting socket...`);
+
+        if (sessionData.cookies && sessionData.utk) {
+            initChatSocket();
+            setTimeout(pollArabicChatOnce, 300);
+        } else if (chatSocket) {
+            try { chatSocket.disconnect(); } catch (e) {}
+            chatSocket = null;
+            socketConnected = false;
+        }
+    }
 
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
-    addLog(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp ? 'YES' : 'NO'}). Reconnecting socket...`);
-    console.log(`[API] Session updated (Cookies: ${(sessionData.cookies || '').length} chars, PHPSESSID: ${hasPhp}). Reconnecting socket...`);
-
-    initChatSocket();
-    setTimeout(pollArabicChatOnce, 300);
-
     res.json({
         ok: true,
-        message: 'Session stored and socket reconnecting with fresh credentials',
+        changed: changed,
+        message: changed ? 'Session updated successfully' : 'Session unchanged',
         socketConnected: socketConnected,
-        hasPhpsessid: hasPhp
+        hasPhpsessid: hasPhp,
+        recoveryKey: (accKey && accountSessions[accKey]) ? accountSessions[accKey].recoveryKey : undefined
     });
 });
 
@@ -956,11 +2520,16 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
         time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         timestamp: Date.now(),
         type: 'received',
-        synced: false
+        synced: false,
+        owner: getOwnerId(req)
     };
 
-    messages.push(testMsg);
-    saveJson(MESSAGES_FILE, messages);
+    const candidate = [...messages, testMsg];
+    const saved = saveJson(MESSAGES_FILE, candidate);
+    if (!saved) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
+    }
+    messages = candidate;
 
     res.json({
         ok: true,
@@ -971,8 +2540,11 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
 
 // 8. Clear Messages API
 app.post('/api/clear', requireAuth, (req, res) => {
+    const saved = saveJson(MESSAGES_FILE, []);
+    if (!saved) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
+    }
     messages = [];
-    saveJson(MESSAGES_FILE, messages);
     res.json({ ok: true, message: 'All messages cleared' });
 });
 
@@ -980,7 +2552,7 @@ app.post('/api/clear', requireAuth, (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`=================================================`);
     console.log(`👻 Ghost Cloud Relay Server is RUNNING on port ${PORT}`);
-    console.log(`🔒 Secret Key: ${GHOST_SECRET}`);
+    console.log(`🔒 Secret Key: configured (${GHOST_SECRET.length} chars)`);
     console.log(`🌐 Target: ${SITE_URL}${SOCKET_PATH}`);
     console.log(`=================================================`);
 

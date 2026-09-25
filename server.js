@@ -477,18 +477,9 @@ function getOwnerId(req) {
                 }
             }
             // Personal Server / Single-Tenant Fallback:
-            // If only 1 account exists on the server, associate and register this token under the single account!
+            // If only 1 account exists on the server, associate this token under the single account for reading (no mutation on GET)
             if (activeKeys.length === 1) {
-                const singleKey = activeKeys[0];
-                const acc = accountSessions[singleKey];
-                if (!Array.isArray(acc.utks)) {
-                    acc.utks = acc.utk ? [acc.utk] : [];
-                }
-                if (!acc.utks.includes(cleanToken)) {
-                    acc.utks.push(cleanToken);
-                    saveJson(ACCOUNTS_FILE, accountSessions);
-                }
-                return singleKey;
+                return activeKeys[0];
             }
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
@@ -2082,6 +2073,29 @@ app.post('/api/session', requireAuth, (req, res) => {
         } else {
             // New/different token without cookies: DO NOT inherit prior account cookies!
             candidateCookies = '';
+        }
+    }
+
+    // Safe Cookie Merge: If incoming candidateCookies does not include PHPSESSID, but existing account or prevSession has valid PHPSESSID for this user/account, preserve it!
+    const incomingPhp = candidateCookies ? candidateCookies.match(/PHPSESSID=([^;]+)/i) : null;
+    let fallbackPhp = null;
+    if (!incomingPhp) {
+        if (candidateUtk) {
+            for (const [k, acc] of Object.entries(accountSessions)) {
+                if (acc && !acc.revoked && (acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk)))) {
+                    const m = (acc.cookies || '').match(/PHPSESSID=([^;]+)/i);
+                    if (m) { fallbackPhp = m[1]; break; }
+                }
+            }
+        }
+        if (!fallbackPhp && prevSession && prevSession.cookies) {
+            const m = prevSession.cookies.match(/PHPSESSID=([^;]+)/i);
+            if (m && (!candidateUtk || candidateUtk === prevSession.utk)) {
+                fallbackPhp = m[1];
+            }
+        }
+        if (fallbackPhp) {
+            candidateCookies = (candidateCookies ? candidateCookies.replace(/;?\s*$/, '; ') : '') + `PHPSESSID=${fallbackPhp}`;
         }
     }
 

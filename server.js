@@ -1434,7 +1434,15 @@ app.get('/api/status', (req, res) => {
     }
 
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
-    const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]) : [];
+    const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]).filter(Boolean) : [];
+    const hasAuthCookies = Boolean(
+        sessionData.cookies && (
+            hasPhp ||
+            sessionData.cookies.includes('bc_auth') ||
+            sessionData.cookies.includes('chat-session') ||
+            cookieKeys.length > 0
+        )
+    );
 
     // Per-account status determination
     const reqOwner = getOwnerId(req);
@@ -1476,7 +1484,8 @@ app.get('/api/status', (req, res) => {
         hasSession: !!(sessionData.utk || sessionData.cookies),
         sessionUtkPresent: !!sessionData.utk,
         sessionCookiesPresent: !!sessionData.cookies,
-        hasPhpsessid: hasPhp,
+        hasPhpsessid: hasPhp || hasAuthCookies,
+        hasSessionCookies: hasAuthCookies,
         cookieKeys: cookieKeys,
         sessionLastUpdated: sessionData.lastUpdated,
         lastConnectedTime: lastConnectedTime,
@@ -2493,12 +2502,22 @@ app.post('/api/session', requireAuth, (req, res) => {
     }
 
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
+    const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]).filter(Boolean) : [];
+    const hasAuthCookies = Boolean(
+        sessionData.cookies && (
+            hasPhp ||
+            sessionData.cookies.includes('bc_auth') ||
+            sessionData.cookies.includes('chat-session') ||
+            cookieKeys.length > 0
+        )
+    );
     res.json({
         ok: true,
         changed: changed,
         message: changed ? 'Session updated successfully' : 'Session unchanged',
         socketConnected: socketConnected,
-        hasPhpsessid: hasPhp,
+        hasPhpsessid: hasPhp || hasAuthCookies,
+        hasSessionCookies: hasAuthCookies,
         recoveryKey: (accKey && accountSessions[accKey]) ? accountSessions[accKey].recoveryKey : undefined
     });
 });

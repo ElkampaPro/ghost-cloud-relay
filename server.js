@@ -463,6 +463,8 @@ function hasRegisteredAccounts() {
 }
 
 function getOwnerId(req) {
+    const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
+
     // 1. Authenticated client context via request headers, body, or query
     if (req) {
         const headers = req.headers || {};
@@ -474,6 +476,20 @@ function getOwnerId(req) {
                     return key;
                 }
             }
+            // Personal Server / Single-Tenant Fallback:
+            // If only 1 account exists on the server, associate and register this token under the single account!
+            if (activeKeys.length === 1) {
+                const singleKey = activeKeys[0];
+                const acc = accountSessions[singleKey];
+                if (!Array.isArray(acc.utks)) {
+                    acc.utks = acc.utk ? [acc.utk] : [];
+                }
+                if (!acc.utks.includes(cleanToken)) {
+                    acc.utks.push(cleanToken);
+                    saveJson(ACCOUNTS_FILE, accountSessions);
+                }
+                return singleKey;
+            }
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
 
@@ -482,7 +498,12 @@ function getOwnerId(req) {
             return 'unauthorized_forged_session';
         }
 
-        // When registered accounts exist, any HTTP request lacking an account token is unauthorized
+        // When registered accounts exist:
+        // If there is only 1 active account on this personal server, use it!
+        if (activeKeys.length === 1) {
+            return activeKeys[0];
+        }
+
         if (hasRegisteredAccounts()) {
             return 'unauthorized_missing_token';
         }
@@ -494,6 +515,10 @@ function getOwnerId(req) {
     if (sessionData) {
         const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk);
         if (stableId) return stableId;
+    }
+
+    if (activeKeys.length === 1) {
+        return activeKeys[0];
     }
 
     return 'default_owner';
@@ -1433,26 +1458,19 @@ app.get('/api/status', (req, res) => {
         });
     }
 
-    const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
-    const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]).filter(Boolean) : [];
-    const hasAuthCookies = Boolean(
-        sessionData.cookies && (
-            hasPhp ||
-            sessionData.cookies.includes('bc_auth') ||
-            sessionData.cookies.includes('chat-session') ||
-            cookieKeys.length > 0
-        )
-    );
-
-    // Per-account status determination
+    const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
     const reqOwner = getOwnerId(req);
     let accountConnected = undefined;
     let accountLastError = undefined;
     let accountLastConnectedTime = undefined;
     let accountLastMessageTime = undefined;
 
-    if (reqOwner && !reqOwner.startsWith('unauthorized_') && reqOwner !== 'default_owner') {
-        const entry = accountSockets.get(reqOwner);
+    const targetKey = (reqOwner && !reqOwner.startsWith('unauthorized_') && reqOwner !== 'default_owner') 
+        ? reqOwner 
+        : (activeKeys.length === 1 ? activeKeys[0] : null);
+
+    if (targetKey) {
+        const entry = accountSockets.get(targetKey);
         if (entry) {
             accountConnected = !!entry.connected;
             accountLastError = entry.lastError;
@@ -1463,6 +1481,20 @@ app.get('/api/status', (req, res) => {
             accountLastError = 'Account socket not connected';
         }
     }
+
+    const targetAcc = targetKey ? accountSessions[targetKey] : null;
+    const effCookies = (targetAcc && targetAcc.cookies) || sessionData.cookies || '';
+    const effUtk = (targetAcc && targetAcc.utk) || sessionData.utk || '';
+    const hasPhp = effCookies.includes('PHPSESSID');
+    const cookieKeys = effCookies ? effCookies.split(';').map(c => c.trim().split('=')[0]).filter(Boolean) : [];
+    const hasAuthCookies = Boolean(
+        effCookies && (
+            hasPhp ||
+            effCookies.includes('bc_auth') ||
+            effCookies.includes('chat-session') ||
+            cookieKeys.length > 0
+        )
+    );
 
     const accountsSummary = {};
     for (const [k, acc] of Object.entries(accountSessions)) {
@@ -1477,22 +1509,24 @@ app.get('/api/status', (req, res) => {
         }
     }
 
+    const relevantMessages = targetKey ? messages.filter(m => m.owner === targetKey) : messages;
+
     res.json({
         ok: true,
         socketConnected: isAnySocketConnected,
         siteUrl: SITE_URL,
-        hasSession: !!(sessionData.utk || sessionData.cookies),
-        sessionUtkPresent: !!sessionData.utk,
-        sessionCookiesPresent: !!sessionData.cookies,
+        hasSession: !!(effUtk || effCookies),
+        sessionUtkPresent: !!effUtk,
+        sessionCookiesPresent: !!effCookies,
         hasPhpsessid: hasPhp || hasAuthCookies,
         hasSessionCookies: hasAuthCookies,
         cookieKeys: cookieKeys,
-        sessionLastUpdated: sessionData.lastUpdated,
-        lastConnectedTime: lastConnectedTime,
-        lastError: lastError,
-        accountConnected: accountConnected,
-        accountLastError: accountLastError,
-        accountLastConnectedTime: accountLastConnectedTime,
+        sessionLastUpdated: (targetAcc && targetAcc.lastUpdated) || sessionData.lastUpdated,
+        lastConnectedTime: accountLastConnectedTime || lastConnectedTime,
+        lastError: accountLastError || lastError,
+        accountConnected: accountConnected !== undefined ? accountConnected : isAnySocketConnected,
+        accountLastError: accountLastError || lastError,
+        accountLastConnectedTime: accountLastConnectedTime || lastConnectedTime,
         accountLastMessageTime: accountLastMessageTime,
         accounts: accountsSummary,
         retentionPolicy: 'fifo',
@@ -1503,8 +1537,8 @@ app.get('/api/status', (req, res) => {
         lastPollTime: lastPollStats.lastPollTime,
         lastPollStatus: lastPollStats.status,
         lastPollCycles: lastPollStats.totalCycles,
-        totalMessages: messages.length,
-        unsyncedCount: messages.filter(m => !m.synced).length
+        totalMessages: relevantMessages.length,
+        unsyncedCount: relevantMessages.filter(m => !m.synced).length
     });
 });
 

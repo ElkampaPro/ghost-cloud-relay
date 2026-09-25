@@ -1449,6 +1449,38 @@ app.get('/api/status', (req, res) => {
         });
     }
 
+    // Auto-unify duplicate orphaned utk_ accounts that have 0 messages into the live connected account
+    const connectedAccount = Array.from(accountSockets.entries()).find(([k, entry]) => entry && entry.connected);
+    if (connectedAccount) {
+        const [connKey] = connectedAccount;
+        let accountsChanged = false;
+        for (const [k, acc] of Object.entries(accountSessions)) {
+            if (k !== connKey && !acc.revoked && k.startsWith('utk_')) {
+                const hasMsgs = messages.some(m => m.owner === k);
+                if (!hasMsgs) {
+                    console.log(`[Account Auto-Merge] Merging orphaned tokenless account ${k} into live connected account ${connKey}`);
+                    if (!Array.isArray(accountSessions[connKey].utks)) accountSessions[connKey].utks = [];
+                    if (Array.isArray(acc.utks)) {
+                        acc.utks.forEach(t => {
+                            if (!accountSessions[connKey].utks.includes(t)) {
+                                accountSessions[connKey].utks.push(t);
+                            }
+                        });
+                    }
+                    if (acc.utk && !accountSessions[connKey].utks.includes(acc.utk)) {
+                        accountSessions[connKey].utks.push(acc.utk);
+                    }
+                    disconnectAccountSocket(k);
+                    delete accountSessions[k];
+                    accountsChanged = true;
+                }
+            }
+        }
+        if (accountsChanged) {
+            saveJson(ACCOUNTS_FILE, accountSessions);
+        }
+    }
+
     const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
     const reqOwner = getOwnerId(req);
     let accountConnected = undefined;
@@ -2094,12 +2126,48 @@ app.post('/api/session', requireAuth, (req, res) => {
                 fallbackPhp = m[1];
             }
         }
+        if (!fallbackPhp) {
+            // Personal Relay Fallback: If caller holds valid GHOST_SECRET, inherit PHPSESSID from any active connected account
+            for (const [k, acc] of Object.entries(accountSessions)) {
+                if (acc && !acc.revoked && acc.cookies) {
+                    const m = acc.cookies.match(/PHPSESSID=([^;]+)/i);
+                    if (m) { fallbackPhp = m[1]; break; }
+                }
+            }
+        }
         if (fallbackPhp) {
             candidateCookies = (candidateCookies ? candidateCookies.replace(/;?\s*$/, '; ') : '') + `PHPSESSID=${fallbackPhp}`;
         }
     }
 
-    const accKey = extractStableAccountId(candidateCookies, candidateUtk);
+    // Personal Relay Multi-Device Unification:
+    // If incoming cookies from mobile lack full credentials, inherit from primary active account
+    const incomingUserId = extractExplicitUserId(candidateCookies);
+    const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
+    const primaryActive = activeEntries.find(([k, acc]) => {
+        if (!acc.cookies) return false;
+        const accUserId = extractExplicitUserId(acc.cookies);
+        if (incomingUserId && accUserId && incomingUserId !== accUserId) return false;
+        return true;
+    });
+
+    if (primaryActive) {
+        const [primKey, primAcc] = primaryActive;
+        const primCookies = primAcc.cookies || '';
+        if (candidateCookies.length < primCookies.length) {
+            candidateCookies = primCookies;
+        }
+        if (candidateUtk && Array.isArray(primAcc.utks) && !primAcc.utks.includes(candidateUtk)) {
+            primAcc.utks.push(candidateUtk);
+        }
+    }
+
+    let accKey = extractStableAccountId(candidateCookies, candidateUtk);
+    if (primaryActive && (!incomingUserId || incomingUserId === extractExplicitUserId(primaryActive[1].cookies))) {
+        if (!accKey || accKey.startsWith('utk_')) {
+            accKey = primaryActive[0];
+        }
+    }
 
     const isRevocation = (cookies !== undefined || utk !== undefined) && !candidateCookies && !candidateUtk;
     if (isRevocation) {

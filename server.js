@@ -476,23 +476,12 @@ function getOwnerId(req) {
                     return key;
                 }
             }
-            // Personal Server / Single-Tenant Fallback:
-            // If only 1 account exists on the server, associate this token under the single account for reading (no mutation on GET)
-            if (activeKeys.length === 1) {
-                return activeKeys[0];
-            }
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
 
         // x-ghost-session header without secret token is explicitly rejected to prevent forgery
         if (headers['x-ghost-session']) {
             return 'unauthorized_forged_session';
-        }
-
-        // When registered accounts exist:
-        // If there is only 1 active account on this personal server, use it!
-        if (activeKeys.length === 1) {
-            return activeKeys[0];
         }
 
         if (hasRegisteredAccounts()) {
@@ -1449,38 +1438,6 @@ app.get('/api/status', (req, res) => {
         });
     }
 
-    // Auto-unify duplicate orphaned utk_ accounts that have 0 messages into the live connected account
-    const connectedAccount = Array.from(accountSockets.entries()).find(([k, entry]) => entry && entry.connected);
-    if (connectedAccount) {
-        const [connKey] = connectedAccount;
-        let accountsChanged = false;
-        for (const [k, acc] of Object.entries(accountSessions)) {
-            if (k !== connKey && !acc.revoked && k.startsWith('utk_')) {
-                const hasMsgs = messages.some(m => m.owner === k);
-                if (!hasMsgs) {
-                    console.log(`[Account Auto-Merge] Merging orphaned tokenless account ${k} into live connected account ${connKey}`);
-                    if (!Array.isArray(accountSessions[connKey].utks)) accountSessions[connKey].utks = [];
-                    if (Array.isArray(acc.utks)) {
-                        acc.utks.forEach(t => {
-                            if (!accountSessions[connKey].utks.includes(t)) {
-                                accountSessions[connKey].utks.push(t);
-                            }
-                        });
-                    }
-                    if (acc.utk && !accountSessions[connKey].utks.includes(acc.utk)) {
-                        accountSessions[connKey].utks.push(acc.utk);
-                    }
-                    disconnectAccountSocket(k);
-                    delete accountSessions[k];
-                    accountsChanged = true;
-                }
-            }
-        }
-        if (accountsChanged) {
-            saveJson(ACCOUNTS_FILE, accountSessions);
-        }
-    }
-
     const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
     const reqOwner = getOwnerId(req);
     let accountConnected = undefined;
@@ -1578,7 +1535,13 @@ app.get('/api/logs', requireAuth, (req, res) => {
 app.get('/api/sync', requireAuth, (req, res) => {
     const currentOwner = getOwnerId(req);
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
-        return res.json({ ok: true, count: 0, messages: [], serverTime: Date.now() });
+        return res.status(401).json({
+            ok: false,
+            count: 0,
+            messages: [],
+            error: 'Unauthorized: valid account token is required',
+            serverTime: Date.now()
+        });
     }
     const markAsSynced = req.query.mark === 'true'; // Only mark if explicitly asked
     const getAll = req.query.all !== 'false'; // Default to TRUE so all devices get full sync
@@ -2110,29 +2073,26 @@ app.post('/api/session', requireAuth, (req, res) => {
 
     // Safe Cookie Merge: If incoming candidateCookies does not include PHPSESSID, but existing account or prevSession has valid PHPSESSID for this user/account, preserve it!
     const incomingPhp = candidateCookies ? candidateCookies.match(/PHPSESSID=([^;]+)/i) : null;
+    const incomingUserId = extractExplicitUserId(candidateCookies);
     let fallbackPhp = null;
+
     if (!incomingPhp) {
         if (candidateUtk) {
             for (const [k, acc] of Object.entries(accountSessions)) {
                 if (acc && !acc.revoked && (acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk)))) {
-                    const m = (acc.cookies || '').match(/PHPSESSID=([^;]+)/i);
-                    if (m) { fallbackPhp = m[1]; break; }
+                    const accUserId = extractExplicitUserId(acc.cookies);
+                    if (!incomingUserId || !accUserId || incomingUserId === accUserId) {
+                        const m = (acc.cookies || '').match(/PHPSESSID=([^;]+)/i);
+                        if (m) { fallbackPhp = m[1]; break; }
+                    }
                 }
             }
         }
-        if (!fallbackPhp && prevSession && prevSession.cookies) {
-            const m = prevSession.cookies.match(/PHPSESSID=([^;]+)/i);
-            if (m && (!candidateUtk || candidateUtk === prevSession.utk)) {
-                fallbackPhp = m[1];
-            }
-        }
-        if (!fallbackPhp) {
-            // Personal Relay Fallback: If caller holds valid GHOST_SECRET, inherit PHPSESSID from any active connected account
-            for (const [k, acc] of Object.entries(accountSessions)) {
-                if (acc && !acc.revoked && acc.cookies) {
-                    const m = acc.cookies.match(/PHPSESSID=([^;]+)/i);
-                    if (m) { fallbackPhp = m[1]; break; }
-                }
+        if (!fallbackPhp && prevSession && prevSession.cookies && (!candidateUtk || candidateUtk === prevSession.utk)) {
+            const prevUserId = extractExplicitUserId(prevSession.cookies);
+            if (!incomingUserId || !prevUserId || incomingUserId === prevUserId) {
+                const m = prevSession.cookies.match(/PHPSESSID=([^;]+)/i);
+                if (m) fallbackPhp = m[1];
             }
         }
         if (fallbackPhp) {
@@ -2140,34 +2100,42 @@ app.post('/api/session', requireAuth, (req, res) => {
         }
     }
 
-    // Personal Relay Multi-Device Unification:
-    // If incoming cookies from mobile lack full credentials, inherit from primary active account
-    const incomingUserId = extractExplicitUserId(candidateCookies);
-    const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
-    const primaryActive = activeEntries.find(([k, acc]) => {
-        if (!acc.cookies) return false;
-        const accUserId = extractExplicitUserId(acc.cookies);
-        if (incomingUserId && accUserId && incomingUserId !== accUserId) return false;
-        return true;
-    });
+    // Guard against unauthenticated partial sessions & cross-user pollution:
+    const hasIncomingAuth = Boolean(
+        (candidateCookies && (candidateCookies.includes('PHPSESSID') || candidateCookies.includes('bc_auth') || candidateCookies.includes('chat-session')))
+    );
+    const clientRecoveryKey = (req.headers && (req.headers['x-ghost-recovery-key'] || req.headers['x-ghost-admin-key'])) ||
+                             (req.body && (req.body.recoveryKey || req.body.adminKey)) ||
+                             (req.query && (req.query.recoveryKey || req.query.adminKey));
+    const cleanRecoveryKey = clientRecoveryKey ? String(clientRecoveryKey).trim() : null;
 
-    if (primaryActive) {
-        const [primKey, primAcc] = primaryActive;
-        const primCookies = primAcc.cookies || '';
-        if (candidateCookies.length < primCookies.length) {
-            candidateCookies = primCookies;
-        }
-        if (candidateUtk && Array.isArray(primAcc.utks) && !primAcc.utks.includes(candidateUtk)) {
-            primAcc.utks.push(candidateUtk);
+    const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
+    const matchingAcc = activeEntries.find(([k, acc]) => 
+        (candidateUtk && (acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk)))) ||
+        (cleanRecoveryKey && acc.recoveryKey === cleanRecoveryKey)
+    );
+
+    // If partial cookies are sent without complete auth and token is foreign / unauthenticated, reject!
+    if (!hasIncomingAuth && !matchingAcc) {
+        return res.status(401).json({
+            ok: false,
+            error: 'Unauthorized: complete session cookies or matching device token required'
+        });
+    }
+
+    // Cross-user inheritance check:
+    if (matchingAcc) {
+        const [accKey, accObj] = matchingAcc;
+        const accUserId = extractExplicitUserId(accObj.cookies);
+        if (incomingUserId && accUserId && incomingUserId !== accUserId) {
+            return res.status(403).json({
+                ok: false,
+                error: 'Forbidden: user identity mismatch for existing account'
+            });
         }
     }
 
     let accKey = extractStableAccountId(candidateCookies, candidateUtk);
-    if (primaryActive && (!incomingUserId || incomingUserId === extractExplicitUserId(primaryActive[1].cookies))) {
-        if (!accKey || accKey.startsWith('utk_')) {
-            accKey = primaryActive[0];
-        }
-    }
 
     const isRevocation = (cookies !== undefined || utk !== undefined) && !candidateCookies && !candidateUtk;
     if (isRevocation) {

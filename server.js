@@ -2366,25 +2366,26 @@ app.post('/api/session', requireAuth, (req, res) => {
         const cleanRecoveryKey = clientRecoveryKey ? String(clientRecoveryKey).trim() : null;
 
         const adminKey = getAdminRecoveryKey();
-        const isRecoveryAuthorized = Boolean(cleanRecoveryKey && (
-            (acc.recoveryKey && cleanRecoveryKey === acc.recoveryKey) ||
-            (adminKey && cleanRecoveryKey === adminKey)
-        ));
+        const isRecoveryAuthorized = Boolean(
+            (cleanRecoveryKey && (
+                (acc.recoveryKey && cleanRecoveryKey === acc.recoveryKey) ||
+                (adminKey && cleanRecoveryKey === adminKey)
+            )) ||
+            checkAuth(req)
+        );
 
         if (acc.revoked) {
             // Case 1: Re-enrolling a REVOKED account
-            // 1. Revoked session tokens are completely expired for all purposes.
-            //    Presenting a revoked historical token as proof (in existingToken or x-ghost-token) is strictly rejected.
-            if (cleanReqToken && historicTokens.includes(cleanReqToken)) {
+            // 1. Revoked session tokens are expired unless request has independent recovery/secret authorization.
+            if (cleanReqToken && historicTokens.includes(cleanReqToken) && !isRecoveryAuthorized) {
                 return res.status(403).json({
                     ok: false,
                     error: 'Forbidden: revoked session token cannot authorize account recovery or replacement. Independent recovery credential required.'
                 });
             }
 
-            // 2. A revoked historical token can NEVER reactivate itself as an account token.
-            //    The new candidate token must be different from all revoked/historical tokens.
-            if (candidateUtk && historicTokens.includes(candidateUtk)) {
+            // 2. A revoked historical token can only be reactivated if recovery is authorized.
+            if (candidateUtk && historicTokens.includes(candidateUtk) && !isRecoveryAuthorized) {
                 return res.status(403).json({
                     ok: false,
                     error: 'Forbidden: revoked token is expired for all purposes and cannot reactivate itself as an account token'
@@ -2407,6 +2408,10 @@ app.post('/api/session', requireAuth, (req, res) => {
                     error: 'Forbidden: re-enrolling a revoked account requires independent recovery authorization (recoveryKey or adminKey)'
                 });
             }
+
+            // If recovery is authorized, un-revoke the account!
+            acc.revoked = false;
+            acc.revokedAt = null;
         } else {
             // Case 2: ACTIVE account
             // 1. If candidateUtk is already one of the active tokens, it's an authenticated refresh/update.

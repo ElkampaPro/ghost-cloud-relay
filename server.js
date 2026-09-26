@@ -2816,6 +2816,14 @@ app.post('/api/accounts/clean', requireAuth, (req, res) => {
         }
     }
 
+    if (keepKey && accountSessions[keepKey]) {
+        sessionData.cookies = accountSessions[keepKey].cookies || '';
+        sessionData.utk = accountSessions[keepKey].utk || '';
+        sessionData.userAgent = accountSessions[keepKey].userAgent || '';
+        sessionData.lastUpdated = accountSessions[keepKey].lastUpdated || new Date().toISOString();
+        saveJson(SESSION_FILE, sessionData);
+    }
+
     saveJson(ACCOUNTS_FILE, accountSessions);
     addLog(`[Accounts] Cleaned up ${purgedCount} dead or inactive account(s) from cloud relay.`);
     res.json({ ok: true, purgedCount, activeAccounts: Object.keys(accountSessions) });

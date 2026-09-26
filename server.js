@@ -33,6 +33,8 @@ const SESSION_FILE = path.join(DATA_DIR, 'session.json');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const TRANSACTION_FILE = path.join(DATA_DIR, 'transaction.json');
 const DELETION_CUTOFFS_FILE = path.join(DATA_DIR, 'deletion_cutoffs.json');
+const DEVICE_CURSORS_FILE = path.join(DATA_DIR, 'device_cursors.json');
+const EPOCH_FILE = path.join(DATA_DIR, 'epoch.json');
 const PID_FILE = path.join(__dirname, 'server.pid');
 
 let storageHealth = { ok: true, error: null, lastIncident: null };
@@ -112,6 +114,45 @@ function applyRetentionPolicy(candidateMessages) {
 
 let messages = loadJson(MESSAGES_FILE, []);
 let deletionCutoffs = loadJson(DELETION_CUTOFFS_FILE, {});
+let deviceCursors = loadJson(DEVICE_CURSORS_FILE, {});
+
+let epochData = loadJson(EPOCH_FILE, null);
+if (!epochData || !epochData.epoch) {
+    epochData = { epoch: Date.now() };
+    saveJson(EPOCH_FILE, epochData);
+}
+const SERVER_EPOCH = epochData.epoch;
+
+const ownerSeqCounters = {};
+let messagesUpdatedWithSeq = false;
+if (Array.isArray(messages)) {
+    messages.forEach(m => {
+        const owner = m.owner || 'default';
+        if (!ownerSeqCounters[owner]) ownerSeqCounters[owner] = 0;
+        if (typeof m.seq === 'number' && Number.isFinite(m.seq)) {
+            if (m.seq > ownerSeqCounters[owner]) {
+                ownerSeqCounters[owner] = m.seq;
+            }
+        }
+    });
+    messages.forEach(m => {
+        const owner = m.owner || 'default';
+        if (typeof m.seq !== 'number' || !Number.isFinite(m.seq)) {
+            ownerSeqCounters[owner] = (ownerSeqCounters[owner] || 0) + 1;
+            m.seq = ownerSeqCounters[owner];
+            messagesUpdatedWithSeq = true;
+        }
+    });
+    if (messagesUpdatedWithSeq) {
+        saveJson(MESSAGES_FILE, messages);
+    }
+}
+
+function nextOwnerSeq(owner) {
+    const key = owner || 'default';
+    ownerSeqCounters[key] = (ownerSeqCounters[key] || 0) + 1;
+    return ownerSeqCounters[key];
+}
 
 function isPeerTombstoned(owner, peerId, timestamp) {
     if (!owner || !peerId) return false;
@@ -693,6 +734,8 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             entry.connectingStartedAt = null;
             entry.lastConnectedTime = new Date().toISOString();
             entry.lastError = null;
+            entry.authFailures = 0;
+            entry.authExpired = false;
             socketConnected = true;
             lastConnectedTime = entry.lastConnectedTime;
             lastError = null;
@@ -713,6 +756,15 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             socketConnected = Array.from(accountSockets.values()).some(e => e.connected);
             lastError = entry.lastError;
             addLog(`[Socket:${accKey}] Connection error: ${entry.lastError}`);
+
+            if (err && (err.message === 'unauthorized' || String(err.message || '').includes('unauthorized'))) {
+                entry.authFailures = (entry.authFailures || 0) + 1;
+                if (entry.authFailures >= 2) {
+                    entry.authExpired = true;
+                    if (sock && typeof sock.disconnect === 'function') sock.disconnect();
+                    addLog(`[Socket:${accKey}] Token expired (unauthorized). Auto-pausing reconnection watchdog until updated session is pushed.`);
+                }
+            }
         });
 
         sock.on('error', (err) => {
@@ -753,13 +805,14 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
                 // Check for duplicate using composite logic
                 const exists = messages.some(m => isDuplicateMessage(m, parsed));
                 if (!exists) {
+                    parsed.seq = nextOwnerSeq(accKey);
                     const candidate = [...messages, parsed];
                     const trimmed = applyRetentionPolicy(candidate);
                     const saved = saveJson(MESSAGES_FILE, trimmed);
                     if (saved) {
                         messages = trimmed;
                         recordIncomingToPendingTransaction(parsed);
-                        addLog(`[Ghost Cloud] Captured message for account ${accKey} (id: ${parsed.id})`);
+                        addLog(`[Ghost Cloud] Captured message for account ${accKey} (id: ${parsed.id}, seq: ${parsed.seq})`);
                     } else {
                         console.error('[Socket] Failed to persist captured message to disk');
                     }
@@ -966,8 +1019,11 @@ function startPollingEngine() {
         let hasActiveTarget = false;
         for (const [accKey, acc] of Object.entries(accountSessions)) {
             if (acc && !acc.revoked && acc.cookies && acc.utk) {
-                hasActiveTarget = true;
                 const entry = accountSockets.get(accKey);
+                if (entry && entry.authExpired) {
+                    continue; // Skip reconnecting on expired/unauthorized account until updated
+                }
+                hasActiveTarget = true;
                 const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 20000);
                 if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
                     console.log(`[Socket Watchdog] Socket dropped or idle for account ${accKey}. Reconnecting account ${accKey}...`);
@@ -1531,7 +1587,7 @@ app.get('/api/logs', requireAuth, (req, res) => {
     });
 });
 
-// 3. Sync Messages (Multi-Device Safe: PC, Kiwi Mobile, PWA)
+// 3. Sync Messages (Multi-Device Safe: PC, Mobile, PWA with Monotonic seq_id & Device Cursors)
 app.get('/api/sync', requireAuth, (req, res) => {
     const currentOwner = getOwnerId(req);
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
@@ -1543,14 +1599,34 @@ app.get('/api/sync', requireAuth, (req, res) => {
             serverTime: Date.now()
         });
     }
-    const markAsSynced = req.query.mark === 'true'; // Only mark if explicitly asked
+    const markAsSynced = req.query.mark === 'true'; // Legacy fallback
     const getAll = req.query.all !== 'false'; // Default to TRUE so all devices get full sync
     const since = parseInt(req.query.since || '0', 10);
+    const deviceId = req.query.device_id ? String(req.query.device_id).slice(0, 128) : null;
+    const hasAfterSeq = req.query.after_seq !== undefined || req.query.since_seq !== undefined;
+    const rawAfterSeq = req.query.after_seq !== undefined ? req.query.after_seq : req.query.since_seq;
+    const afterSeq = hasAfterSeq ? parseInt(rawAfterSeq, 10) : null;
 
     const ownerMessages = messages.filter(m => Boolean(m.owner) && m.owner === currentOwner);
+    const currentSeq = ownerSeqCounters[currentOwner] || 0;
 
     let resultMsgs = [];
-    if (getAll) {
+    let snapshotRequired = false;
+
+    if (afterSeq !== null && !isNaN(afterSeq)) {
+        if (ownerMessages.length > 0) {
+            const minSeq = Math.min(...ownerMessages.map(m => (typeof m.seq === 'number' ? m.seq : 1)));
+            if (afterSeq > 0 && afterSeq < minSeq - 1) {
+                // Device lagged behind pruned retention horizon -> require snapshot
+                snapshotRequired = true;
+                resultMsgs = [...ownerMessages];
+            } else {
+                resultMsgs = ownerMessages.filter(m => (m.seq || 0) > afterSeq);
+            }
+        } else {
+            resultMsgs = [];
+        }
+    } else if (getAll) {
         resultMsgs = since > 0 ? ownerMessages.filter(m => m.timestamp > since) : [...ownerMessages];
     } else {
         resultMsgs = ownerMessages.filter(m => !m.synced && (since === 0 || m.timestamp > since));
@@ -1568,11 +1644,58 @@ app.get('/api/sync', requireAuth, (req, res) => {
         messages = candidate;
     }
 
+    // Note: GET /api/sync is strictly read-only and idempotent.
+    // Device cursor is only advanced via explicit POST /api/sync/ack after client confirms local persistence.
+
     res.json({
         ok: true,
         count: resultMsgs.length,
         messages: resultMsgs,
+        epoch: SERVER_EPOCH,
+        current_seq: currentSeq,
+        snapshot_required: snapshotRequired,
         serverTime: Date.now()
+    });
+});
+
+// 3.1 Per-Device Cursor Acknowledgement API (Zero-Seen Safe)
+app.post('/api/sync/ack', requireAuth, (req, res) => {
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized: valid account token is required' });
+    }
+
+    const { device_id, ack_seq, epoch } = req.body || {};
+    if (!device_id) {
+        return res.status(400).json({ ok: false, error: 'Missing device_id' });
+    }
+
+    const safeDeviceId = String(device_id).slice(0, 128);
+    const parsedAckSeq = parseInt(ack_seq, 10);
+    if (isNaN(parsedAckSeq) || parsedAckSeq < 0) {
+        return res.status(400).json({ ok: false, error: 'Invalid ack_seq' });
+    }
+
+    const cursorKey = `${currentOwner}:${safeDeviceId}`;
+    const prevCursor = deviceCursors[cursorKey] || {};
+    const epochMismatch = Boolean(epoch && Number(epoch) !== Number(SERVER_EPOCH));
+
+    if (parsedAckSeq >= (prevCursor.ack_seq || 0) || epochMismatch) {
+        deviceCursors[cursorKey] = {
+            ack_seq: parsedAckSeq,
+            last_sync: Date.now(),
+            epoch: SERVER_EPOCH
+        };
+        saveJson(DEVICE_CURSORS_FILE, deviceCursors);
+    }
+
+    res.json({
+        ok: true,
+        device_id: safeDeviceId,
+        ack_seq: parsedAckSeq,
+        epoch: SERVER_EPOCH,
+        epoch_mismatch: epochMismatch,
+        current_seq: ownerSeqCounters[currentOwner] || 0
     });
 });
 
@@ -1610,6 +1733,7 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
 
     const exists = messages.some(m => isDuplicateMessage(m, sentItem));
     if (!exists) {
+        sentItem.seq = nextOwnerSeq(resolvedOwner);
         const candidate = [...messages, sentItem];
         const trimmed = applyRetentionPolicy(candidate);
         const saved = saveJson(MESSAGES_FILE, trimmed);
@@ -1618,7 +1742,7 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
         }
         messages = trimmed;
         recordIncomingToPendingTransaction(sentItem);
-        console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message (id: ${sentItem.id})`);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message (id: ${sentItem.id}, seq: ${sentItem.seq})`);
     }
 
     res.json({ ok: true, data: sentItem });
@@ -1657,6 +1781,7 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
 
     const exists = messages.some(m => isDuplicateMessage(m, incomingItem));
     if (!exists) {
+        incomingItem.seq = nextOwnerSeq(currentOwner);
         const candidate = [...messages, incomingItem];
         const trimmed = applyRetentionPolicy(candidate);
         const saved = saveJson(MESSAGES_FILE, trimmed);
@@ -1665,7 +1790,7 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
         }
         messages = trimmed;
         recordIncomingToPendingTransaction(incomingItem);
-        console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message (id: ${incomingItem.id})`);
+        console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message (id: ${incomingItem.id}, seq: ${incomingItem.seq})`);
     }
 
     res.json({ ok: true, data: incomingItem });
@@ -2424,6 +2549,17 @@ app.post('/api/session', requireAuth, (req, res) => {
                 }
             });
 
+            // Single-Account Enforcement:
+            if (req.body.singleAccount || req.body.replaceOthers) {
+                for (const [k, acc] of Object.entries(accountSessions)) {
+                    if (k !== accKey && acc) {
+                        acc.revoked = true;
+                        disconnectAccountSocket(k);
+                    }
+                }
+                addLog(`[Accounts] Single-Account Mode: Set ${accKey} as the only active cloud account.`);
+            }
+
             // Write transaction journal to disk to guarantee recoverability across restarts BEFORE touching ANY state files!
             const txRecord = {
                 id: 'tx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
@@ -2606,6 +2742,26 @@ app.post('/api/session', requireAuth, (req, res) => {
     });
 });
 
+// Clean dead/unauthorized/non-current accounts
+app.post('/api/accounts/clean', requireAuth, (req, res) => {
+    let purgedCount = 0;
+    const currentOwner = getOwnerId(req);
+    const keepKey = req.body.keepKey || (currentOwner && !currentOwner.startsWith('unauthorized_') ? currentOwner : null);
+
+    for (const [k, acc] of Object.entries(accountSessions)) {
+        const isTarget = keepKey ? (k !== keepKey) : (acc.revoked || (accountSockets.get(k) && accountSockets.get(k).authExpired));
+        if (isTarget) {
+            disconnectAccountSocket(k);
+            delete accountSessions[k];
+            purgedCount++;
+        }
+    }
+
+    saveJson(ACCOUNTS_FILE, accountSessions);
+    addLog(`[Accounts] Cleaned up ${purgedCount} dead or inactive account(s) from cloud relay.`);
+    res.json({ ok: true, purgedCount, activeAccounts: Object.keys(accountSessions) });
+});
+
 // 7. Test Message Injector (For debugging and manual verification)
 app.post('/api/test-msg', requireAuth, (req, res) => {
     const { peer, name, message } = req.body;
@@ -2613,8 +2769,10 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
     const testName = name || 'تجربة سحابية 👻';
     const testText = message || 'هذه رسالة واردة تم التقاطها عبر السيرفر السحابي أثناء إغلاق المتصفح!';
 
+    const testOwner = getOwnerId(req);
     const testMsg = {
         id: 'msg_test_' + Date.now(),
+        seq: nextOwnerSeq(testOwner),
         peerId: testPeer,
         name: testName,
         avatar: 'default_images/avatar/default_avatar.png',
@@ -2624,7 +2782,7 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
         timestamp: Date.now(),
         type: 'received',
         synced: false,
-        owner: getOwnerId(req)
+        owner: testOwner
     };
 
     const candidate = [...messages, testMsg];

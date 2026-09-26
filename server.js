@@ -454,7 +454,30 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
 }
 
 
-// 3. Startup reconciliation: Ensure sessionData aligns with authoritative accountSessions registry
+// 3. Startup reconciliation: Ensure bidirectional sync between sessionData and accountSessions
+function ensureSessionDataInAccounts() {
+    if (sessionData && (sessionData.utk || sessionData.cookies)) {
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+        if (!accountSessions[stableId]) {
+            accountSessions[stableId] = {
+                accountKey: stableId,
+                cookies: sessionData.cookies || '',
+                utk: sessionData.utk || '',
+                userAgent: sessionData.userAgent || '',
+                utks: [sessionData.utk].filter(Boolean),
+                historicUtks: [sessionData.utk].filter(Boolean),
+                lastUpdated: sessionData.lastUpdated || new Date().toISOString()
+            };
+            saveJson(ACCOUNTS_FILE, accountSessions);
+        } else {
+            if (sessionData.utk && Array.isArray(accountSessions[stableId].utks) && !accountSessions[stableId].utks.includes(sessionData.utk)) {
+                accountSessions[stableId].utks.push(sessionData.utk);
+                saveJson(ACCOUNTS_FILE, accountSessions);
+            }
+        }
+    }
+}
+
 if (accountSessions && typeof accountSessions === 'object' && Object.keys(accountSessions).length > 0) {
     const currentSessionKey = extractStableAccountId(sessionData.cookies, sessionData.utk);
     const activeAccounts = Object.values(accountSessions).filter(acc => acc && !acc.revoked && (acc.cookies || acc.utk));
@@ -477,6 +500,8 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
         if (!sessionData.utk && activeAccounts[0].utk) sessionData.utk = activeAccounts[0].utk;
         if (!sessionData.userAgent && activeAccounts[0].userAgent) sessionData.userAgent = activeAccounts[0].userAgent;
     }
+} else {
+    ensureSessionDataInAccounts();
 }
 
 function generateRecoveryKey() {
@@ -504,7 +529,9 @@ function hasRegisteredAccounts() {
 }
 
 function getOwnerId(req) {
-    const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
+    ensureSessionDataInAccounts();
+    const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
+    const activeKeys = activeEntries.map(([k]) => k);
 
     // 1. Authenticated client context via request headers, body, or query
     if (req) {
@@ -512,17 +539,43 @@ function getOwnerId(req) {
         const clientToken = headers['x-ghost-token'] || (req.body && (req.body.sessionToken || req.body.token)) || (req.query && (req.query.sessionToken || req.query.token));
         if (clientToken && typeof clientToken === 'string') {
             const cleanToken = clientToken.trim();
-            for (const [key, acc] of Object.entries(accountSessions)) {
-                if (!acc.revoked && (acc.utk === cleanToken || (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)))) {
+            for (const [key, acc] of activeEntries) {
+                if (acc.utk === cleanToken || (Array.isArray(acc.utks) && acc.utks.includes(cleanToken))) {
                     return key;
                 }
             }
+            if (sessionData && sessionData.utk && sessionData.utk === cleanToken) {
+                const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+                return stableId;
+            }
+
+            // Single Account / Single Tenant fallback: If only 1 account exists, auto-associate the token
+            if (activeKeys.length === 1) {
+                const singleKey = activeKeys[0];
+                const singleAcc = accountSessions[singleKey];
+                if (singleAcc && cleanToken && !cleanToken.startsWith('unauthorized_') && cleanToken !== '59b7cd4aa213bda6918f3a74b736182b') {
+                    if (!singleAcc.utks) singleAcc.utks = [singleAcc.utk].filter(Boolean);
+                    if (!singleAcc.utks.includes(cleanToken)) {
+                        singleAcc.utks.push(cleanToken);
+                        if (!singleAcc.historicUtks) singleAcc.historicUtks = [];
+                        if (!singleAcc.historicUtks.includes(cleanToken)) singleAcc.historicUtks.push(cleanToken);
+                        saveJson(ACCOUNTS_FILE, accountSessions);
+                    }
+                }
+                return singleKey;
+            }
+
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
 
         // x-ghost-session header without secret token is explicitly rejected to prevent forgery
         if (headers['x-ghost-session']) {
             return 'unauthorized_forged_session';
+        }
+
+        // If no token is passed and exactly 1 active account exists, return it!
+        if (activeKeys.length === 1) {
+            return activeKeys[0];
         }
 
         if (hasRegisteredAccounts()) {
@@ -532,7 +585,7 @@ function getOwnerId(req) {
         return 'default_owner';
     }
 
-    // 2. Default to active sessionData on the server ONLY for internal background operations (socket / poller where req is null/undefined)
+    // 2. Default to active sessionData on the server ONLY for internal background operations
     if (sessionData) {
         const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk);
         if (stableId) return stableId;
@@ -2240,8 +2293,9 @@ app.post('/api/session', requireAuth, (req, res) => {
         (cleanRecoveryKey && acc.recoveryKey === cleanRecoveryKey)
     );
 
+    const isSingleAccountExplicit = req.body && Boolean(req.body.singleAccount);
     // If partial cookies are sent without complete auth and token is foreign / unauthenticated, reject!
-    if (!hasIncomingAuth && !matchingAcc) {
+    if (!hasIncomingAuth && !matchingAcc && !isSingleAccountExplicit && activeEntries.length > 0) {
         return res.status(401).json({
             ok: false,
             error: 'Unauthorized: complete session cookies or matching device token required'

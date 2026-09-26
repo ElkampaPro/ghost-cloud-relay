@@ -601,7 +601,10 @@ function getOwnerId(req) {
 
 function isDuplicateMessage(existing, incoming) {
     if (!existing || !incoming) return false;
-    if (existing.id && incoming.id && String(existing.id) === String(incoming.id)) {
+    const isGenericExisting = !existing.id || existing.id === '0' || existing.id === 'undefined' || existing.id === 'null';
+    const isGenericIncoming = !incoming.id || incoming.id === '0' || incoming.id === 'undefined' || incoming.id === 'null';
+
+    if (!isGenericExisting && !isGenericIncoming && String(existing.id) === String(incoming.id)) {
         if (existing.owner && incoming.owner && existing.owner !== incoming.owner) {
             return false;
         }
@@ -612,6 +615,12 @@ function isDuplicateMessage(existing, incoming) {
             return false;
         }
         return true;
+    }
+    // Content-based deduplication for exact duplicates received within 2.5 seconds
+    if (existing.peerId === incoming.peerId && existing.type === incoming.type && existing.owner === incoming.owner) {
+        if (existing.text && incoming.text && existing.text === incoming.text && Math.abs((existing.timestamp || 0) - (incoming.timestamp || 0)) < 2500) {
+            return true;
+        }
     }
     return false;
 }
@@ -624,8 +633,17 @@ function stripHtml(html) {
 
 function parseIncomingMessage(data, targetOwner = null) {
     if (!data) return null;
-    const peerId = String(data.peer || data.target || '');
-    if (!peerId || peerId === '0') return null;
+    let peerId = String(data.peer || data.target || data.from || data.sender || data.user_id || data.f_user || data.userId || '');
+    if (!peerId || peerId === '0') {
+        if (data.html) {
+            const m = String(data.html).match(/(?:data|data-id|data-user|target)=["']?(\d+)["']?/i);
+            if (m && m[1] && m[1] !== '0') peerId = m[1];
+        }
+    }
+    if (!peerId || peerId === '0') {
+        console.warn(`[parseIncomingMessage] Dropping message: peerId unresolved from payload:`, JSON.stringify(data).slice(0, 200));
+        return null;
+    }
 
     let senderName = 'مستخدم ' + peerId;
     let msgText = '';
@@ -661,9 +679,18 @@ function parseIncomingMessage(data, targetOwner = null) {
         msgHtml = msgText;
     }
 
-    if (!msgText && !msgHtml) return null;
+    if (!msgText && !msgHtml) {
+        if (data.html) {
+            msgHtml = String(data.html);
+            msgText = stripHtml(msgHtml) || '[محتوى وسائط/صورة]';
+        } else {
+            return null;
+        }
+    }
 
-    const messageId = String(data.id || ('msg_cloud_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)));
+    const rawId = data.id || data.msg_id || data.message_id;
+    const isRealId = rawId && String(rawId) !== '0' && String(rawId) !== 'undefined' && String(rawId) !== 'null';
+    const messageId = isRealId ? String(rawId) : ('msg_cloud_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
     const timeNow = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
 
     return {
@@ -671,8 +698,8 @@ function parseIncomingMessage(data, targetOwner = null) {
         peerId: peerId,
         name: senderName,
         avatar: avatarSrc,
-        text: msgText,
-        html: msgHtml || msgText,
+        text: msgText || '[رسالة خاصة]',
+        html: msgHtml || msgText || '[رسالة خاصة]',
         time: timeNow,
         timestamp: Date.now(),
         type: (data.own || data.is_own || data.hunter || (data.html && /hunter_private/i.test(String(data.html)))) ? 'sent' : 'received',
@@ -754,13 +781,14 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
     try {
         const sock = io(SITE_URL, {
             path: SOCKET_PATH,
-            transports: ['websocket'],
+            transports: ['websocket', 'polling'],
             extraHeaders: headers,
             reconnection: true,
-            reconnectionDelay: 1000,
-            reconnectionDelayMax: 10000,
+            reconnectionDelay: 500,
+            reconnectionDelayMax: 2500,
+            randomizationFactor: 0.2,
             autoConnect: true,
-            timeout: 20000
+            timeout: 10000
         });
 
         const entry = {
@@ -834,12 +862,13 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
         }
 
         sock.onAny((event, ...args) => {
-            if (event !== 'ping' && event !== 'pong') {
-                if (event === 'private-msg' || event.includes('msg')) {
-                    addLog(`[Socket Event:${accKey}] ${event} (payload redacted for privacy)`);
-                } else {
-                    addLog(`[Socket Event:${accKey}] ${event}`);
-                }
+            if (event === 'ping' || event === 'pong' || event === 'room-del' || event === 'room-msg' || event.startsWith('room-') || event.startsWith('user-')) {
+                return; // Suppress high-frequency public room noise
+            }
+            if (event === 'private-msg' || event.includes('private') || event.includes('msg')) {
+                addLog(`[Socket Event:${accKey}] ${event} (payload redacted for privacy)`);
+            } else {
+                addLog(`[Socket Event:${accKey}] ${event}`);
             }
         });
 
@@ -1014,8 +1043,10 @@ async function pollSingleAccount(target) {
 
                 const sockEntry = accountSockets.get(target.key);
                 if (!sockEntry || !sockEntry.connected || !sockEntry.socket || !sockEntry.socket.connected) {
-                    console.log(`[Cloud Poller:${target.key}] Socket disconnected for account ${target.key}. Reconnecting this account...`);
+                    console.log(`[Cloud Poller:${target.key}] Socket dropped while unread messages pending. Force-reconnecting ${target.key} immediately...`);
                     connectAccountSocket(target.key, target.cookies, target.utk, target.userAgent);
+                } else if (sockEntry.socket && typeof sockEntry.socket.emit === 'function') {
+                    try { sockEntry.socket.emit('ping'); } catch (_) {}
                 }
             }
         }
@@ -1054,19 +1085,19 @@ async function pollArabicChatOnce() {
 
 function startPollingEngine() {
     if (pollIntervalTimer) clearInterval(pollIntervalTimer);
-    console.log('[Cloud Poller] Starting 24/7 background polling engine (interval: 5s)...');
-    setTimeout(pollArabicChatOnce, 1500);
-    pollIntervalTimer = setInterval(pollArabicChatOnce, 5000);
+    console.log('[Cloud Poller] Starting 24/7 background polling engine (ultra-vigilant: 2.5s)...');
+    setTimeout(pollArabicChatOnce, 1000);
+    pollIntervalTimer = setInterval(pollArabicChatOnce, 2500);
 
-    // 10-second Active Socket Watchdog (Per-Account Recovery)
+    // 3-second Active Socket Watchdog (Rapid Per-Account Recovery)
     setInterval(() => {
         const hasSessionCreds = Boolean(sessionData && (sessionData.cookies || sessionData.utk));
         const hasActiveAccounts = Object.values(accountSessions).some(a => !a.revoked && a.cookies && a.utk);
         if (!hasSessionCreds && !hasActiveAccounts) {
             return; // Suspended: no active credentials or explicitly revoked
         }
-        if (socketConnectingStartedAt && (Date.now() - socketConnectingStartedAt < 25000)) {
-            return; // Allow active handshake up to 25s without premature termination
+        if (socketConnectingStartedAt && (Date.now() - socketConnectingStartedAt < 15000)) {
+            return; // Allow active handshake up to 15s without premature termination
         }
 
         let hasActiveTarget = false;
@@ -1077,7 +1108,7 @@ function startPollingEngine() {
                     continue; // Skip reconnecting on expired/unauthorized account until updated
                 }
                 hasActiveTarget = true;
-                const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 20000);
+                const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 12000);
                 if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
                     console.log(`[Socket Watchdog] Socket dropped or idle for account ${accKey}. Reconnecting account ${accKey}...`);
                     connectAccountSocket(accKey, acc.cookies, acc.utk, acc.userAgent);
@@ -1089,13 +1120,13 @@ function startPollingEngine() {
         if (!hasActiveTarget && sessionData && sessionData.cookies && sessionData.utk) {
             const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
             const entry = accountSockets.get(stableId);
-            const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 20000);
+            const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 12000);
             if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
                 console.log(`[Socket Watchdog] Fallback socket dropped or idle for ${stableId}. Reconnecting...`);
                 connectAccountSocket(stableId, sessionData.cookies, sessionData.utk, sessionData.userAgent);
             }
         }
-    }, 10000);
+    }, 3000);
 }
 
 // Middleware
@@ -2888,9 +2919,9 @@ app.listen(PORT, '0.0.0.0', () => {
     initChatSocket();
     startPollingEngine();
 
-    // Render Free Tier Keep-Alive: Ping self every 4 minutes to prevent sleeping
+    // Render Free Tier Keep-Alive: Ping self every 90 seconds to prevent sleeping
     const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://ghost-cloud-relay.onrender.com';
     setInterval(() => {
         fetch(`${SELF_URL}/api/status`).catch(() => {});
-    }, 4 * 60 * 1000);
+    }, 90 * 1000);
 });

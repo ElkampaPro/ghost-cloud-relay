@@ -95,21 +95,35 @@ function saveJson(file, data) {
     }
 }
 
-// Message Retention Policy
-const DEFAULT_MAX_MESSAGES = 5000;
-const MAX_MESSAGES = parseInt(process.env.GHOST_MAX_MESSAGES || '', 10) || DEFAULT_MAX_MESSAGES;
+// Message Retention Policy: per-account retention protects accounts from mutual eviction
+const DEFAULT_MAX_MESSAGES_PER_ACCOUNT = 5000;
+const MAX_MESSAGES_PER_ACCOUNT = parseInt(process.env.GHOST_MAX_MESSAGES_PER_ACCOUNT || process.env.GHOST_MAX_MESSAGES || '', 10) || DEFAULT_MAX_MESSAGES_PER_ACCOUNT;
 
 function applyRetentionPolicy(candidateMessages) {
     if (!Array.isArray(candidateMessages)) return [];
-    if (candidateMessages.length <= MAX_MESSAGES) {
-        return candidateMessages;
-    }
-    const dropCount = candidateMessages.length - MAX_MESSAGES;
-    const trimmed = candidateMessages.slice(-MAX_MESSAGES);
-    const line = `[RetentionPolicy] Global retention capacity reached (${candidateMessages.length}/${MAX_MESSAGES}). Trimmed ${dropCount} oldest message(s) under FIFO policy.`;
-    addLog(line);
-    console.warn(line);
-    return trimmed;
+    // Group messages by owner so high volume in one account never purges another account's messages
+    const byOwner = new Map();
+    candidateMessages.forEach(m => {
+        const owner = m.owner || 'default';
+        if (!byOwner.has(owner)) byOwner.set(owner, []);
+        byOwner.get(owner).push(m);
+    });
+
+    const finalMessages = [];
+    byOwner.forEach((ownerMsgs, owner) => {
+        if (ownerMsgs.length > MAX_MESSAGES_PER_ACCOUNT) {
+            const dropCount = ownerMsgs.length - MAX_MESSAGES_PER_ACCOUNT;
+            const kept = ownerMsgs.slice(-MAX_MESSAGES_PER_ACCOUNT);
+            finalMessages.push(...kept);
+            const line = `[RetentionPolicy] Account [${owner}] reached retention capacity (${ownerMsgs.length}/${MAX_MESSAGES_PER_ACCOUNT}). Trimmed ${dropCount} oldest message(s) under per-account FIFO policy.`;
+            addLog(line);
+            console.warn(line);
+        } else {
+            finalMessages.push(...ownerMsgs);
+        }
+    });
+
+    return finalMessages;
 }
 
 let messages = loadJson(MESSAGES_FILE, []);
@@ -123,7 +137,13 @@ if (!epochData || !epochData.epoch) {
 }
 const SERVER_EPOCH = epochData.epoch;
 
-const ownerSeqCounters = {};
+// Dedicated persistent sequence storage independent of message retention/pruning
+const OWNER_SEQUENCES_FILE = path.join(DATA_DIR, 'owner_sequences.json');
+let ownerSeqCounters = loadJson(OWNER_SEQUENCES_FILE, {});
+if (!ownerSeqCounters || typeof ownerSeqCounters !== 'object') {
+    ownerSeqCounters = {};
+}
+
 let messagesUpdatedWithSeq = false;
 if (Array.isArray(messages)) {
     messages.forEach(m => {
@@ -146,11 +166,13 @@ if (Array.isArray(messages)) {
     if (messagesUpdatedWithSeq) {
         saveJson(MESSAGES_FILE, messages);
     }
+    saveJson(OWNER_SEQUENCES_FILE, ownerSeqCounters);
 }
 
 function nextOwnerSeq(owner) {
     const key = owner || 'default';
     ownerSeqCounters[key] = (ownerSeqCounters[key] || 0) + 1;
+    saveJson(OWNER_SEQUENCES_FILE, ownerSeqCounters);
     return ownerSeqCounters[key];
 }
 
@@ -243,7 +265,10 @@ function extractExplicitUserId(cookies) {
     return null;
 }
 
-function extractStableAccountId(cookies, utk) {
+function extractStableAccountId(cookies, utk, explicitUserId = null) {
+    if (explicitUserId && typeof explicitUserId === 'string' && explicitUserId.trim()) {
+        return explicitUserId.trim();
+    }
     if (cookies && typeof cookies === 'string') {
         const u = cookies.match(/(?:user_id|my_id)=([^;]+)/i);
         if (u) return u[1].trim();
@@ -536,15 +561,45 @@ function getOwnerId(req) {
     // 1. Authenticated client context via request headers, body, or query
     if (req) {
         const headers = req.headers || {};
+        const isMasterAuthed = checkAuth(req);
         const clientToken = headers['x-ghost-token'] || (req.body && (req.body.sessionToken || req.body.token)) || (req.query && (req.query.sessionToken || req.query.token));
-        if (clientToken && typeof clientToken === 'string') {
-            const cleanToken = clientToken.trim();
+        const explicitUserId = headers['x-ghost-user-id'] || (req.body && req.body.userId) || (req.query && req.query.userId);
+        const explicitAccountKey = headers['x-ghost-account-key'] || (req.body && req.body.accountKey) || (req.query && req.query.accountKey);
+
+        // 1. Direct match by explicitAccountKey
+        if (explicitAccountKey && accountSessions[explicitAccountKey]) {
+            return explicitAccountKey;
+        }
+
+        // 2. Direct match by explicit user ID
+        if (explicitUserId) {
+            const cleanUid = String(explicitUserId).trim();
             for (const [key, acc] of activeEntries) {
-                if (acc.utk === cleanToken || (Array.isArray(acc.utks) && acc.utks.includes(cleanToken))) {
+                const accUid = acc.userId || extractExplicitUserId(acc.cookies);
+                if (accUid && String(accUid) === cleanUid) {
                     return key;
                 }
             }
-            if (sessionData && sessionData.utk && sessionData.utk === cleanToken) {
+        }
+
+        if (clientToken && typeof clientToken === 'string') {
+            const cleanToken = clientToken.trim();
+            // Direct key match (e.g. 'utk_1f71b962c117')
+            if (accountSessions[cleanToken]) {
+                return cleanToken;
+            }
+
+            for (const [key, acc] of activeEntries) {
+                if (key === cleanToken ||
+                    acc.accountKey === cleanToken ||
+                    acc.utk === cleanToken || 
+                    (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)) ||
+                    (acc.userId && String(acc.userId) === cleanToken) ||
+                    (extractExplicitUserId(acc.cookies) === cleanToken)) {
+                    return key;
+                }
+            }
+            if (sessionData && sessionData.utk && (sessionData.utk === cleanToken || extractStableAccountId(sessionData.cookies, sessionData.utk) === cleanToken)) {
                 const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
                 return stableId;
             }
@@ -553,7 +608,7 @@ function getOwnerId(req) {
             if (activeKeys.length === 1) {
                 const singleKey = activeKeys[0];
                 const singleAcc = accountSessions[singleKey];
-                if (singleAcc && cleanToken && !cleanToken.startsWith('unauthorized_') && cleanToken !== '59b7cd4aa213bda6918f3a74b736182b') {
+                if (singleAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
                     if (!singleAcc.utks) singleAcc.utks = [singleAcc.utk].filter(Boolean);
                     if (!singleAcc.utks.includes(cleanToken)) {
                         singleAcc.utks.push(cleanToken);
@@ -565,12 +620,31 @@ function getOwnerId(req) {
                 return singleKey;
             }
 
+            // Master-authenticated fallback: if caller has the secret key, associate or bind to active account
+            if (isMasterAuthed && activeKeys.length > 0) {
+                const primaryKey = activeKeys[0];
+                const primaryAcc = accountSessions[primaryKey];
+                if (primaryAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
+                    if (!primaryAcc.utks) primaryAcc.utks = [primaryAcc.utk].filter(Boolean);
+                    if (!primaryAcc.utks.includes(cleanToken)) {
+                        primaryAcc.utks.push(cleanToken);
+                        saveJson(ACCOUNTS_FILE, accountSessions);
+                    }
+                }
+                return primaryKey;
+            }
+
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
 
         // x-ghost-session header without secret token is explicitly rejected to prevent forgery
-        if (headers['x-ghost-session']) {
+        if (headers['x-ghost-session'] && !isMasterAuthed) {
             return 'unauthorized_forged_session';
+        }
+
+        // Master-authenticated request with no token: default to active account
+        if (isMasterAuthed && activeKeys.length > 0) {
+            return activeKeys[0];
         }
 
         // If no token is passed and exactly 1 active account exists, return it!
@@ -688,7 +762,10 @@ function parseIncomingMessage(data, targetOwner = null) {
         }
     }
 
-    const rawId = data.id || data.msg_id || data.message_id;
+    const htmlId = data.html && String(data.html).match(/<li\b[^>]*\bdata-id\s*=\s*["']?(\d+)/i);
+    const explicitId = data.id || data.msg_id || data.message_id;
+    const rawId = explicitId && !['0', 'undefined', 'null'].includes(String(explicitId))
+        ? explicitId : (htmlId && htmlId[1]);
     const isRealId = rawId && String(rawId) !== '0' && String(rawId) !== 'undefined' && String(rawId) !== 'null';
     const messageId = isRealId ? String(rawId) : ('msg_cloud_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
     const timeNow = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
@@ -1698,7 +1775,11 @@ app.get('/api/sync', requireAuth, (req, res) => {
     let snapshotRequired = false;
 
     if (afterSeq !== null && !isNaN(afterSeq)) {
-        if (ownerMessages.length > 0) {
+        if (afterSeq > currentSeq) {
+            // Client cursor exceeds server's current sequence (e.g. server reset or invalid cursor) -> require snapshot
+            snapshotRequired = true;
+            resultMsgs = [...ownerMessages];
+        } else if (ownerMessages.length > 0) {
             const minSeq = Math.min(...ownerMessages.map(m => (typeof m.seq === 'number' ? m.seq : 1)));
             if (afterSeq > 0 && afterSeq < minSeq - 1) {
                 // Device lagged behind pruned retention horizon -> require snapshot
@@ -2282,7 +2363,7 @@ app.post('/api/session', requireAuth, (req, res) => {
 
     // Safe Cookie Merge: If incoming candidateCookies does not include PHPSESSID, but existing account or prevSession has valid PHPSESSID for this user/account, preserve it!
     const incomingPhp = candidateCookies ? candidateCookies.match(/PHPSESSID=([^;]+)/i) : null;
-    const incomingUserId = extractExplicitUserId(candidateCookies);
+    const incomingUserId = extractExplicitUserId(candidateCookies) || (req.body && (req.body.userId || req.body.user_id)) || (req.headers && req.headers['x-ghost-user-id']);
     let fallbackPhp = null;
 
     if (!incomingPhp) {
@@ -2345,7 +2426,7 @@ app.post('/api/session', requireAuth, (req, res) => {
         }
     }
 
-    let accKey = extractStableAccountId(candidateCookies, candidateUtk);
+    let accKey = extractStableAccountId(candidateCookies, candidateUtk, incomingUserId);
 
     const isRevocation = (cookies !== undefined || utk !== undefined) && !candidateCookies && !candidateUtk;
     if (isRevocation) {
@@ -2836,7 +2917,42 @@ app.post('/api/session', requireAuth, (req, res) => {
 app.post('/api/accounts/clean', requireAuth, (req, res) => {
     let purgedCount = 0;
     const currentOwner = getOwnerId(req);
-    const keepKey = req.body.keepKey || (currentOwner && !currentOwner.startsWith('unauthorized_') ? currentOwner : null);
+    let keepKey = req.body.keepKey || (currentOwner && !currentOwner.startsWith('unauthorized_') ? currentOwner : null);
+    const keepUserId = req.body.userId || (req.headers && req.headers['x-ghost-user-id']);
+
+    // Resolve keepKey if raw utk, accountKey, or userId was passed
+    if (keepKey && !accountSessions[keepKey]) {
+        for (const [k, acc] of Object.entries(accountSessions)) {
+            if (k === keepKey ||
+                acc.accountKey === keepKey ||
+                acc.utk === keepKey ||
+                (Array.isArray(acc.utks) && acc.utks.includes(keepKey)) ||
+                (acc.userId && String(acc.userId) === String(keepKey)) ||
+                (extractExplicitUserId(acc.cookies) === String(keepKey))) {
+                keepKey = k;
+                break;
+            }
+        }
+    }
+
+    if (!keepKey && keepUserId) {
+        const cleanUid = String(keepUserId).trim();
+        for (const [k, acc] of Object.entries(accountSessions)) {
+            const accUid = acc.userId || extractExplicitUserId(acc.cookies);
+            if (accUid && String(accUid) === cleanUid) {
+                keepKey = k;
+                break;
+            }
+        }
+    }
+
+    // If still not resolved but we have active accounts, pick the current owner or first active
+    if (!keepKey) {
+        const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
+        if (activeKeys.length > 0) {
+            keepKey = activeKeys[0];
+        }
+    }
 
     for (const [k, acc] of Object.entries(accountSessions)) {
         const isTarget = keepKey ? (k !== keepKey) : (acc.revoked || (accountSockets.get(k) && accountSockets.get(k).authExpired));
@@ -2853,11 +2969,24 @@ app.post('/api/accounts/clean', requireAuth, (req, res) => {
         sessionData.userAgent = accountSessions[keepKey].userAgent || '';
         sessionData.lastUpdated = accountSessions[keepKey].lastUpdated || new Date().toISOString();
         saveJson(SESSION_FILE, sessionData);
+
+        // Reassign any messages of purged accounts to keepKey so messages are preserved!
+        let reallocated = 0;
+        messages.forEach(m => {
+            if (!m.owner || m.owner !== keepKey) {
+                m.owner = keepKey;
+                reallocated++;
+            }
+        });
+        if (reallocated > 0) {
+            saveJson(MESSAGES_FILE, messages);
+            addLog(`[Accounts] Reallocated ${reallocated} message(s) to single active account [${keepKey}].`);
+        }
     }
 
     saveJson(ACCOUNTS_FILE, accountSessions);
-    addLog(`[Accounts] Cleaned up ${purgedCount} dead or inactive account(s) from cloud relay.`);
-    res.json({ ok: true, purgedCount, activeAccounts: Object.keys(accountSessions) });
+    addLog(`[Accounts] Cleaned up ${purgedCount} dead or inactive account(s) from cloud relay. Kept: [${keepKey}].`);
+    res.json({ ok: true, purgedCount, keptAccount: keepKey, activeAccounts: Object.keys(accountSessions) });
 });
 
 // 7. Test Message Injector (For debugging and manual verification)

@@ -169,6 +169,54 @@ if (Array.isArray(messages)) {
     saveJson(OWNER_SEQUENCES_FILE, ownerSeqCounters);
 }
 
+// Purge any cross-peer duplicate messages for the same owner from cloud persistence
+if (Array.isArray(messages)) {
+    const ownerPeerMessageCounts = new Map();
+    messages.forEach(m => {
+        const key = `${m.owner || 'default'}:${m.peerId}`;
+        ownerPeerMessageCounts.set(key, (ownerPeerMessageCounts.get(key) || 0) + 1);
+    });
+
+    const claimedMessageOwners = new Map();
+    const sortedCandidateMsgs = [...messages].sort((a, b) => {
+        const countA = ownerPeerMessageCounts.get(`${a.owner || 'default'}:${a.peerId}`) || 0;
+        const countB = ownerPeerMessageCounts.get(`${b.owner || 'default'}:${b.peerId}`) || 0;
+        return countB - countA;
+    });
+
+    const dedupedMessages = [];
+    let crossPeerPurged = 0;
+    sortedCandidateMsgs.forEach(m => {
+        if (!m || !m.id) {
+            dedupedMessages.push(m);
+            return;
+        }
+        const sId = String(m.id);
+        const isGeneric = sId === '0' || sId === 'undefined' || sId === 'null' || sId.startsWith('msg_sent_') || sId.startsWith('msg_in_');
+        if (isGeneric) {
+            dedupedMessages.push(m);
+            return;
+        }
+        const claimKey = `${m.owner || 'default'}:${sId}`;
+        const existingClaimPeer = claimedMessageOwners.get(claimKey);
+        if (!existingClaimPeer) {
+            claimedMessageOwners.set(claimKey, m.peerId);
+            dedupedMessages.push(m);
+        } else if (existingClaimPeer === m.peerId) {
+            dedupedMessages.push(m);
+        } else {
+            crossPeerPurged++;
+            console.warn(`[Cloud Deduplication] Purged leaked cross-peer message ${sId} from peer ${m.peerId} (claimed by peer ${existingClaimPeer})`);
+        }
+    });
+
+    if (crossPeerPurged > 0) {
+        messages = dedupedMessages;
+        saveJson(MESSAGES_FILE, messages);
+        console.log(`[Cloud Deduplication] Total ${crossPeerPurged} cross-peer leaked messages purged from cloud storage.`);
+    }
+}
+
 function nextOwnerSeq(owner) {
     const key = owner || 'default';
     ownerSeqCounters[key] = (ownerSeqCounters[key] || 0) + 1;
@@ -566,46 +614,48 @@ function getOwnerId(req) {
         const explicitUserId = headers['x-ghost-user-id'] || (req.body && req.body.userId) || (req.query && req.query.userId);
         const explicitAccountKey = headers['x-ghost-account-key'] || (req.body && req.body.accountKey) || (req.query && req.query.accountKey);
 
-        // 1. Direct match by explicitAccountKey
-        if (explicitAccountKey && accountSessions[explicitAccountKey]) {
-            return explicitAccountKey;
-        }
-
-        // 2. Direct match by explicit user ID
-        if (explicitUserId) {
-            const cleanUid = String(explicitUserId).trim();
-            for (const [key, acc] of activeEntries) {
-                const accUid = acc.userId || extractExplicitUserId(acc.cookies);
-                if (accUid && String(accUid) === cleanUid) {
-                    return key;
-                }
-            }
-        }
-
+        // 1. If clientToken is provided, resolve owner strictly via clientToken first!
         if (clientToken && typeof clientToken === 'string') {
             const cleanToken = clientToken.trim();
-            // Direct key match (e.g. 'utk_1f71b962c117')
-            if (accountSessions[cleanToken]) {
-                return cleanToken;
-            }
+            let tokenOwnerKey = null;
 
-            for (const [key, acc] of activeEntries) {
-                if (key === cleanToken ||
-                    acc.accountKey === cleanToken ||
-                    acc.utk === cleanToken || 
-                    (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)) ||
-                    (acc.userId && String(acc.userId) === cleanToken) ||
-                    (extractExplicitUserId(acc.cookies) === cleanToken)) {
-                    return key;
+            if (accountSessions[cleanToken]) {
+                tokenOwnerKey = cleanToken;
+            } else {
+                for (const [key, acc] of activeEntries) {
+                    if (key === cleanToken ||
+                        acc.accountKey === cleanToken ||
+                        acc.utk === cleanToken || 
+                        (Array.isArray(acc.utks) && acc.utks.includes(cleanToken)) ||
+                        (acc.userId && String(acc.userId) === cleanToken) ||
+                        (extractExplicitUserId(acc.cookies) === cleanToken)) {
+                        tokenOwnerKey = key;
+                        break;
+                    }
                 }
             }
-            if (sessionData && sessionData.utk && (sessionData.utk === cleanToken || extractStableAccountId(sessionData.cookies, sessionData.utk) === cleanToken)) {
-                const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
-                return stableId;
+
+            if (!tokenOwnerKey && sessionData && sessionData.utk && (sessionData.utk === cleanToken || extractStableAccountId(sessionData.cookies, sessionData.utk) === cleanToken)) {
+                tokenOwnerKey = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
             }
 
-            // Single Account / Single Tenant fallback: If only 1 account exists, auto-associate the token
-            if (activeKeys.length === 1) {
+            if (tokenOwnerKey) {
+                // If explicit account key or user ID is also sent, it MUST match tokenOwnerKey to prevent cross-account leakage
+                if (explicitAccountKey && String(explicitAccountKey) !== String(tokenOwnerKey)) {
+                    return 'unauthorized_token_mismatch';
+                }
+                if (explicitUserId) {
+                    const acc = accountSessions[tokenOwnerKey];
+                    const accUid = acc ? (acc.userId || extractExplicitUserId(acc.cookies)) : null;
+                    if (accUid && String(accUid) !== String(explicitUserId).trim()) {
+                        return 'unauthorized_token_mismatch';
+                    }
+                }
+                return tokenOwnerKey;
+            }
+
+            // Single Account / Single Tenant fallback: If only 1 account exists, auto-associate the token ONLY if caller is master-authenticated
+            if (activeKeys.length === 1 && isMasterAuthed) {
                 const singleKey = activeKeys[0];
                 const singleAcc = accountSessions[singleKey];
                 if (singleAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
@@ -635,6 +685,22 @@ function getOwnerId(req) {
             }
 
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+        }
+
+        // 2. When NO clientToken is provided, only allow explicit selectors if request is master-authenticated!
+        if (isMasterAuthed) {
+            if (explicitAccountKey && accountSessions[explicitAccountKey]) {
+                return explicitAccountKey;
+            }
+            if (explicitUserId) {
+                const cleanUid = String(explicitUserId).trim();
+                for (const [key, acc] of activeEntries) {
+                    const accUid = acc.userId || extractExplicitUserId(acc.cookies);
+                    if (accUid && String(accUid) === cleanUid) {
+                        return key;
+                    }
+                }
+            }
         }
 
         // x-ghost-session header without secret token is explicitly rejected to prevent forgery
@@ -682,16 +748,13 @@ function isDuplicateMessage(existing, incoming) {
         if (existing.owner && incoming.owner && existing.owner !== incoming.owner) {
             return false;
         }
-        if (existing.peerId && incoming.peerId && String(existing.peerId) !== String(incoming.peerId)) {
-            return false;
-        }
-        if (existing.type && incoming.type && existing.type !== incoming.type) {
-            return false;
-        }
+        // In the database, each message ID is globally unique.
+        // It cannot belong to multiple peers or have conflicting types for the same owner.
         return true;
     }
     // Content-based deduplication for exact duplicates received within 2.5 seconds
-    if (existing.peerId === incoming.peerId && existing.type === incoming.type && existing.owner === incoming.owner) {
+    // ONLY apply when one or both messages lack a non-generic ID (e.g. synthetic relay messages)
+    if ((isGenericExisting || isGenericIncoming) && existing.peerId === incoming.peerId && existing.type === incoming.type && existing.owner === incoming.owner) {
         if (existing.text && incoming.text && existing.text === incoming.text && Math.abs((existing.timestamp || 0) - (incoming.timestamp || 0)) < 2500) {
             return true;
         }
@@ -1841,17 +1904,27 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         return res.status(400).json({ ok: false, error: 'Invalid ack_seq' });
     }
 
+    const currentOwnerSeq = ownerSeqCounters[currentOwner] || 0;
+    if (parsedAckSeq > currentOwnerSeq) {
+        return res.status(400).json({ ok: false, error: 'Invalid ack_seq: cannot exceed current_seq', current_seq: currentOwnerSeq });
+    }
+
     const cursorKey = `${currentOwner}:${safeDeviceId}`;
     const prevCursor = deviceCursors[cursorKey] || {};
     const epochMismatch = Boolean(epoch && Number(epoch) !== Number(SERVER_EPOCH));
 
     if (parsedAckSeq >= (prevCursor.ack_seq || 0) || epochMismatch) {
-        deviceCursors[cursorKey] = {
+        const nextCursor = {
             ack_seq: parsedAckSeq,
             last_sync: Date.now(),
             epoch: SERVER_EPOCH
         };
-        saveJson(DEVICE_CURSORS_FILE, deviceCursors);
+        const candidateCursors = Object.assign({}, deviceCursors, { [cursorKey]: nextCursor });
+        const saved = saveJson(DEVICE_CURSORS_FILE, candidateCursors);
+        if (!saved) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update device cursor' });
+        }
+        deviceCursors = candidateCursors;
     }
 
     res.json({

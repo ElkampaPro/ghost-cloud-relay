@@ -640,15 +640,19 @@ function getOwnerId(req) {
             }
 
             if (tokenOwnerKey) {
-                // If explicit account key or user ID is also sent, it MUST match tokenOwnerKey to prevent cross-account leakage
+                // If explicit account key or user ID is also sent, it MUST match tokenOwnerKey to prevent cross-account leakage (unless master authenticated with secret)
                 if (explicitAccountKey && String(explicitAccountKey) !== String(tokenOwnerKey)) {
-                    return 'unauthorized_token_mismatch';
+                    if (!isMasterAuthed) {
+                        return 'unauthorized_token_mismatch';
+                    }
                 }
                 if (explicitUserId) {
                     const acc = accountSessions[tokenOwnerKey];
                     const accUid = acc ? (acc.userId || extractExplicitUserId(acc.cookies)) : null;
                     if (accUid && String(accUid) !== String(explicitUserId).trim()) {
-                        return 'unauthorized_token_mismatch';
+                        if (!isMasterAuthed) {
+                            return 'unauthorized_token_mismatch';
+                        }
                     }
                 }
                 return tokenOwnerKey;

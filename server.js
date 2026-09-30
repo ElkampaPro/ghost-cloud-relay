@@ -658,6 +658,37 @@ function getOwnerId(req) {
                 return tokenOwnerKey;
             }
 
+            // If explicit account key or user ID is sent and caller is master-authenticated, bind to THAT specified account!
+            if (isMasterAuthed) {
+                if (explicitAccountKey && accountSessions[explicitAccountKey]) {
+                    const targetAcc = accountSessions[explicitAccountKey];
+                    if (targetAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
+                        if (!targetAcc.utks) targetAcc.utks = [targetAcc.utk].filter(Boolean);
+                        if (!targetAcc.utks.includes(cleanToken)) {
+                            targetAcc.utks.push(cleanToken);
+                            saveJson(ACCOUNTS_FILE, accountSessions);
+                        }
+                    }
+                    return explicitAccountKey;
+                }
+                if (explicitUserId) {
+                    const cleanUid = String(explicitUserId).trim();
+                    for (const [key, acc] of activeEntries) {
+                        const accUid = acc.userId || extractExplicitUserId(acc.cookies);
+                        if (accUid && String(accUid) === cleanUid) {
+                            if (cleanToken && !cleanToken.startsWith('unauthorized_')) {
+                                if (!acc.utks) acc.utks = [acc.utk].filter(Boolean);
+                                if (!acc.utks.includes(cleanToken)) {
+                                    acc.utks.push(cleanToken);
+                                    saveJson(ACCOUNTS_FILE, accountSessions);
+                                }
+                            }
+                            return key;
+                        }
+                    }
+                }
+            }
+
             // Single Account / Single Tenant fallback: If only 1 account exists, auto-associate the token ONLY if caller is master-authenticated
             if (activeKeys.length === 1 && isMasterAuthed) {
                 const singleKey = activeKeys[0];
@@ -674,20 +705,7 @@ function getOwnerId(req) {
                 return singleKey;
             }
 
-            // Master-authenticated fallback: if caller has the secret key, associate or bind to active account
-            if (isMasterAuthed && activeKeys.length > 0) {
-                const primaryKey = activeKeys[0];
-                const primaryAcc = accountSessions[primaryKey];
-                if (primaryAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
-                    if (!primaryAcc.utks) primaryAcc.utks = [primaryAcc.utk].filter(Boolean);
-                    if (!primaryAcc.utks.includes(cleanToken)) {
-                        primaryAcc.utks.push(cleanToken);
-                        saveJson(ACCOUNTS_FILE, accountSessions);
-                    }
-                }
-                return primaryKey;
-            }
-
+            // In multi-account mode, do NOT blindly bind unknown tokens to activeKeys[0] without explicit selector!
             return 'unauthorized_token_' + cleanToken.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
         }
 
@@ -782,7 +800,7 @@ function parseIncomingMessage(data, targetOwner = null) {
         }
     }
     if (!peerId || peerId === '0') {
-        console.warn(`[parseIncomingMessage] Dropping message: peerId unresolved from payload:`, JSON.stringify(data).slice(0, 200));
+        console.warn(`[parseIncomingMessage] Dropping message: peerId unresolved. Payload keys:`, Object.keys(data || {}));
         return null;
     }
 
@@ -1686,6 +1704,15 @@ app.get('/', (req, res) => {
             return cleaned;
         }
 
+        function escapeHtml(str) {
+            return String(str || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         function renderActiveMessages(scrollBottom = false) {
             if (!activePeerId) return;
             const target = conversations.find(c => c.peerId === activePeerId);
@@ -1704,7 +1731,7 @@ app.get('/', (req, res) => {
                     <div class="msg_row \${isSent ? 'sent' : 'received'}">
                         <div class="msg_bubble">
                             \${content}
-                            <div class="msg_meta">\${m.time || ''} \${isSent ? '✓✓' : ''}</div>
+                            <div class="msg_meta">\${escapeHtml(m.time || '')} \${isSent ? '✓✓' : ''}</div>
                         </div>
                     </div>
                 \`;
@@ -1927,6 +1954,8 @@ app.get('/api/sync', requireAuth, (req, res) => {
     const hasAfterSeq = req.query.after_seq !== undefined || req.query.since_seq !== undefined;
     const rawAfterSeq = req.query.after_seq !== undefined ? req.query.after_seq : req.query.since_seq;
     const afterSeq = hasAfterSeq ? parseInt(rawAfterSeq, 10) : null;
+    const clientEpoch = req.query.epoch ? String(req.query.epoch).trim() : null;
+    const epochMismatch = Boolean(clientEpoch && clientEpoch !== SERVER_EPOCH);
 
     const ownerMessages = messages.filter(m => Boolean(m.owner) && m.owner === currentOwner);
     const currentSeq = ownerSeqCounters[currentOwner] || 0;
@@ -1934,7 +1963,11 @@ app.get('/api/sync', requireAuth, (req, res) => {
     let resultMsgs = [];
     let snapshotRequired = false;
 
-    if (afterSeq !== null && !isNaN(afterSeq)) {
+    if (epochMismatch) {
+        // Epoch has changed -> client cursor is invalid under new epoch -> force full message snapshot
+        snapshotRequired = true;
+        resultMsgs = [...ownerMessages];
+    } else if (afterSeq !== null && !isNaN(afterSeq)) {
         if (afterSeq > currentSeq) {
             // Client cursor exceeds server's current sequence (e.g. server reset or invalid cursor) -> require snapshot
             snapshotRequired = true;
@@ -1995,10 +2028,9 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         return res.status(400).json({ ok: false, error: 'Missing device_id' });
     }
 
-    const safeDeviceId = String(device_id).slice(0, 128);
-    const parsedAckSeq = parseInt(ack_seq, 10);
-    if (isNaN(parsedAckSeq) || parsedAckSeq < 0) {
-        return res.status(400).json({ ok: false, error: 'Invalid ack_seq' });
+    const parsedAckSeq = Number(ack_seq);
+    if (!Number.isSafeInteger(parsedAckSeq) || parsedAckSeq < 0) {
+        return res.status(400).json({ ok: false, error: 'Invalid ack_seq: must be a safe non-negative integer' });
     }
 
     const currentOwnerSeq = ownerSeqCounters[currentOwner] || 0;
@@ -2008,21 +2040,31 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
 
     const cursorKey = `${currentOwner}:${safeDeviceId}`;
     const prevCursor = deviceCursors[cursorKey] || {};
-    const epochMismatch = Boolean(epoch && Number(epoch) !== Number(SERVER_EPOCH));
+    const epochMismatch = Boolean(epoch && String(epoch).trim() !== String(SERVER_EPOCH).trim());
 
-    if (parsedAckSeq >= (prevCursor.ack_seq || 0) || epochMismatch) {
-        const nextCursor = {
-            ack_seq: parsedAckSeq,
-            last_sync: Date.now(),
-            epoch: SERVER_EPOCH
-        };
-        const candidateCursors = Object.assign({}, deviceCursors, { [cursorKey]: nextCursor });
-        const saved = saveJson(DEVICE_CURSORS_FILE, candidateCursors);
-        if (!saved) {
-            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update device cursor' });
-        }
-        deviceCursors = candidateCursors;
+    if (epochMismatch) {
+        return res.status(409).json({
+            ok: false,
+            error: 'Epoch mismatch: client cursor is from an older epoch',
+            epoch: SERVER_EPOCH,
+            snapshot_required: true
+        });
     }
+
+    const prevAckSeq = Number(prevCursor.ack_seq) || 0;
+    const finalAckSeq = Math.max(prevAckSeq, parsedAckSeq);
+
+    const nextCursor = {
+        ack_seq: finalAckSeq,
+        last_sync: Date.now(),
+        epoch: SERVER_EPOCH
+    };
+    const candidateCursors = Object.assign({}, deviceCursors, { [cursorKey]: nextCursor });
+    const saved = saveJson(DEVICE_CURSORS_FILE, candidateCursors);
+    if (!saved) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update device cursor' });
+    }
+    deviceCursors = candidateCursors;
 
     res.json({
         ok: true,

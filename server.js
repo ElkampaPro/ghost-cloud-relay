@@ -1421,7 +1421,7 @@ app.get('/', (req, res) => {
             <div id="chat_top">
                 <div class="chat_target_info">
                     <button id="back_btn" class="back_btn"><i class="fa fa-arrow-right"></i></button>
-                    <img id="active_avatar" class="contact_avatar" src="https://www.arabic.chat/default_images/avatar/default_avatar.png">
+                    <img id="active_avatar" class="contact_avatar" src="https://storage.arabic.chat/default_images/default_avatar.svg">
                     <div>
                         <div id="active_name" style="font-weight:bold; font-size:14px;">مستخدم</div>
                         <div style="font-size:11px; color:#00bcd4;">محادثة متزامنة مع الكمبيوتر</div>
@@ -1434,6 +1434,20 @@ app.get('/', (req, res) => {
                     <i class="fa fa-comments"></i>
                     اختر محادثة من القائمة لعرض الرسائل المتبادلة
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Video Modal for MP4 & YouTube playback -->
+    <div id="video_modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:10000; align-items:center; justify-content:center; flex-direction:column;">
+        <div style="position:relative; width:92vw; max-width:640px; background:#181818; border-radius:12px; overflow:hidden; box-shadow:0 8px 32px rgba(0,0,0,0.7); border:1px solid #333;">
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 16px; background:#222; color:#fff; border-bottom:1px solid #333;">
+                <span style="font-size:13px; font-weight:bold;"><i class="fa fa-film" style="color:#ff9800; margin-left:6px;"></i>مشغل الفيديو السحابي</span>
+                <button id="close_vid_modal" style="background:none; border:none; color:#aaa; font-size:18px; cursor:pointer;"><i class="fa fa-times"></i></button>
+            </div>
+            <div id="video_holder" style="width:100%; aspect-ratio:16/9; background:#000; display:flex; align-items:center; justify-content:center;">
+                <video id="cloud_video" controls style="width:100%; height:100%; object-fit:contain; display:none;"></video>
+                <iframe id="cloud_iframe" style="width:100%; height:100%; border:none; display:none;" allowfullscreen></iframe>
             </div>
         </div>
     </div>
@@ -1560,7 +1574,7 @@ app.get('/', (req, res) => {
 
             contactsList.innerHTML = filtered.map(c => {
                 const isActive = c.peerId === activePeerId;
-                const rawAv = c.avatar || 'default_images/avatar/default_avatar.png';
+                const rawAv = c.avatar || 'https://storage.arabic.chat/default_images/default_avatar.svg';
                 const avatar = rawAv.startsWith('http') ? rawAv : ('https://www.arabic.chat/' + rawAv.replace(/^\\/+/, ''));
                 const safeAvatar = escapeClientHtml(avatar);
                 const safePeerId = escapeClientHtml(c.peerId);
@@ -1569,7 +1583,7 @@ app.get('/', (req, res) => {
                 const safeSnippet = escapeClientHtml(c.lastText || 'رسالة خاصة');
                 return \`
                     <li class="contact_item \${isActive ? 'active' : ''}" data-peer="\${safePeerId}">
-                        <img class="contact_avatar" src="\${safeAvatar}" onerror="this.src='https://www.arabic.chat/default_images/avatar/default_avatar.png'">
+                        <img class="contact_avatar" src="\${safeAvatar}" onerror="this.src='https://storage.arabic.chat/default_images/default_avatar.svg'">
                         <div class="contact_info">
                             <div class="contact_header">
                                 <span class="contact_name">\${safeName}</span>
@@ -1612,10 +1626,11 @@ app.get('/', (req, res) => {
                     const ALLOWED_ATTRS = {
                         'img': new Set(['src', 'alt', 'class', 'style', 'width', 'height', 'loading']),
                         'audio': new Set(['src', 'controls', 'class', 'style', 'preload']),
-                        'video': new Set(['src', 'controls', 'class', 'style', 'preload', 'width', 'height']),
+                        'video': new Set(['src', 'controls', 'class', 'style', 'preload', 'width', 'height', 'data']),
                         'source': new Set(['src', 'type']),
-                        'a': new Set(['href', 'target', 'rel', 'class', 'style']),
-                        '*': new Set(['class', 'style'])
+                        'a': new Set(['href', 'target', 'rel', 'class', 'style', 'download']),
+                        'div': new Set(['data', 'data-type', 'data-av', 'data-url']),
+                        '*': new Set(['class', 'style', 'data-id', 'data-peer', 'title', 'data', 'data-url'])
                     };
 
                     const elements = doc.body.querySelectorAll('*');
@@ -1703,9 +1718,87 @@ app.get('/', (req, res) => {
         searchInput.oninput = function () {
             renderContactsList();
         };
+
+        // Media Player delegation: Audio & Video
+        messagesArea.addEventListener('click', function(e) {
+            const playBtn = e.target.closest('.sub_play_icon, .sub_play');
+            if (playBtn) {
+                const subPlayer = playBtn.closest('.container_sub_player');
+                const audio = subPlayer ? subPlayer.querySelector('audio') : null;
+                if (audio) {
+                    if (audio.paused) {
+                        document.querySelectorAll('#messages_area audio').forEach(a => { if (a !== audio) a.pause(); });
+                        audio.play().then(() => {
+                            playBtn.innerHTML = '<i class="fa fa-pause"></i>';
+                        }).catch(() => {});
+                    } else {
+                        audio.pause();
+                        playBtn.innerHTML = '<i class="fa fa-play"></i>';
+                    }
+                    audio.onended = () => { playBtn.innerHTML = '<i class="fa fa-play"></i>'; };
+                    audio.onpause = () => { playBtn.innerHTML = '<i class="fa fa-play"></i>'; };
+                    return;
+                }
+            }
+
+            const vidBtn = e.target.closest('.music_video_play, .boom_youtube, .play_video');
+            if (vidBtn) {
+                const container = vidBtn.closest('.container_sub_player, .msg_bubble') || vidBtn;
+                const link = container.querySelector('a.uploaded_music');
+                const audio = container.querySelector('audio');
+                const videoUrl = vidBtn.getAttribute('data-url') || vidBtn.getAttribute('data') ||
+                    (link && link.getAttribute('href')) ||
+                    (audio && audio.getAttribute('src')) || '';
+
+                if (videoUrl) {
+                    openVideoModal(videoUrl);
+                }
+            }
+        });
+
+        function openVideoModal(url) {
+            const modal = document.getElementById('video_modal');
+            const v = document.getElementById('cloud_video');
+            const iframe = document.getElementById('cloud_iframe');
+            modal.style.display = 'flex';
+            if (url.includes('youtube.com/') || url.includes('youtu.be/')) {
+                let ytSrc = url;
+                if (url.includes('watch?v=')) {
+                    ytSrc = 'https://www.youtube.com/embed/' + url.split('watch?v=')[1].split('&')[0];
+                } else if (url.includes('youtu.be/')) {
+                    ytSrc = 'https://www.youtube.com/embed/' + url.split('youtu.be/')[1].split('?')[0];
+                }
+                v.style.display = 'none';
+                v.src = '';
+                iframe.src = ytSrc;
+                iframe.style.display = 'block';
+            } else {
+                iframe.style.display = 'none';
+                iframe.src = '';
+                v.src = url;
+                v.style.display = 'block';
+                v.play().catch(() => {});
+            }
+        }
+
+        document.getElementById('close_vid_modal').onclick = function() {
+            const modal = document.getElementById('video_modal');
+            const v = document.getElementById('cloud_video');
+            const iframe = document.getElementById('cloud_iframe');
+            v.pause();
+            v.removeAttribute('src');
+            v.load();
+            iframe.src = '';
+            modal.style.display = 'none';
+        };
     </script>
 </body>
 </html>`);
+});
+
+// Health check for monitoring and uptime robots
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, status: 'healthy', uptime: Math.round(process.uptime()), service: 'ghost-cloud-relay' });
 });
 
 // 2. Status API
@@ -2410,6 +2503,16 @@ app.post('/api/session', requireAuth, (req, res) => {
 
     const { cookies, utk, userAgent } = req.body;
     const prevSession = sessionData ? { ...sessionData } : null;
+    const isCookieSnapshot = req.body && req.body.cookieSnapshot === true;
+
+    // An explicit empty snapshot is a revocation request. Handle it before
+    // cookie-preservation logic can reattach credentials from the old session.
+    const explicitlyClearingSession = cookies !== undefined && utk !== undefined &&
+        !(typeof cookies === 'string' && cookies.trim()) &&
+        !(typeof utk === 'string' && utk.trim());
+    if (explicitlyClearingSession) {
+        return performRevocation(req, res);
+    }
 
     const candidateUtk = utk !== undefined ? (typeof utk === 'string' ? utk.trim() : '') : (prevSession ? prevSession.utk : '');
     const candidateUserAgent = userAgent !== undefined ? userAgent : (prevSession ? prevSession.userAgent : '');
@@ -2443,7 +2546,7 @@ app.post('/api/session', requireAuth, (req, res) => {
     const incomingUserId = extractExplicitUserId(candidateCookies) || (req.body && (req.body.userId || req.body.user_id)) || (req.headers && req.headers['x-ghost-user-id']);
     let fallbackPhp = null;
 
-    if (!incomingPhp) {
+    if (!incomingPhp && !isCookieSnapshot) {
         if (candidateUtk) {
             for (const [k, acc] of Object.entries(accountSessions)) {
                 if (acc && !acc.revoked && (acc.utk === candidateUtk || (Array.isArray(acc.utks) && acc.utks.includes(candidateUtk)))) {
@@ -2504,11 +2607,6 @@ app.post('/api/session', requireAuth, (req, res) => {
     }
 
     let accKey = extractStableAccountId(candidateCookies, candidateUtk, incomingUserId);
-
-    const isRevocation = (cookies !== undefined || utk !== undefined) && !candidateCookies && !candidateUtk;
-    if (isRevocation) {
-        return performRevocation(req, res);
-    }
 
     // Cross-Account Token Mismatch Protection (F3):
     // A token actively bound to one account cannot be claimed or hijacked by a different user account
@@ -3047,18 +3145,8 @@ app.post('/api/accounts/clean', requireAuth, (req, res) => {
         sessionData.lastUpdated = accountSessions[keepKey].lastUpdated || new Date().toISOString();
         saveJson(SESSION_FILE, sessionData);
 
-        // Reassign any messages of purged accounts to keepKey so messages are preserved!
-        let reallocated = 0;
-        messages.forEach(m => {
-            if (!m.owner || m.owner !== keepKey) {
-                m.owner = keepKey;
-                reallocated++;
-            }
-        });
-        if (reallocated > 0) {
-            saveJson(MESSAGES_FILE, messages);
-            addLog(`[Accounts] Reallocated ${reallocated} message(s) to single active account [${keepKey}].`);
-        }
+        // E03 Fix: Enforce strict account isolation. Never reassign messages across distinct account owners!
+        // Each account retains its own messages securely without cross-account contamination.
     }
 
     saveJson(ACCOUNTS_FILE, accountSessions);

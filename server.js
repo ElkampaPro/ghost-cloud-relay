@@ -1918,7 +1918,7 @@ app.get('/api/status', (req, res) => {
         accountLastMessageTime: accountLastMessageTime,
         accounts: accountsSummary,
         retentionPolicy: 'fifo',
-        maxRetentionMessages: MAX_MESSAGES,
+        maxRetentionMessages: MAX_MESSAGES_PER_ACCOUNT,
         currentRetentionCount: messages.length,
         pollerActive: true,
         storageHealth: storageHealth,

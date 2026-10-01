@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { timingSafeEqual } = require('crypto');
 const { io } = require('socket.io-client');
 require('dotenv').config();
 
@@ -1302,8 +1303,12 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 function checkAuth(req) {
     if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') return false;
-    const key = (req.headers && req.headers['x-ghost-secret']) || (req.body && req.body.key) || (req.query && req.query.key);
-    return Boolean(key && key === GHOST_SECRET && key !== 'ghost_secret_2026');
+    // All shipped clients use this header. Never accept secrets in URLs.
+    const key = req.headers && req.headers['x-ghost-secret'];
+    if (typeof key !== 'string' || !key || key === 'ghost_secret_2026') return false;
+    const provided = Buffer.from(key, 'utf8');
+    const expected = Buffer.from(GHOST_SECRET, 'utf8');
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
 }
 
 // Auth middleware for /api/*
@@ -1977,7 +1982,11 @@ app.get('/api/sync', requireAuth, (req, res) => {
             snapshotRequired = true;
             resultMsgs = [...ownerMessages];
         } else if (ownerMessages.length > 0) {
-            const minSeq = Math.min(...ownerMessages.map(m => (typeof m.seq === 'number' ? m.seq : 1)));
+            let minSeq = Infinity;
+        for (const message of ownerMessages) {
+            const seq = typeof message.seq === 'number' ? message.seq : 1;
+            if (seq < minSeq) minSeq = seq;
+        }
             if (afterSeq > 0 && afterSeq < minSeq - 1) {
                 // Device lagged behind pruned retention horizon -> require snapshot
                 snapshotRequired = true;

@@ -83,7 +83,7 @@ function saveJson(file, data) {
             fs.mkdirSync(dir, { recursive: true });
         }
         tmpFile = path.join(dir, `.tmp_${path.basename(file)}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`);
-        fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf8');
+        fs.writeFileSync(tmpFile, JSON.stringify(data), 'utf8');
         fs.renameSync(tmpFile, file);
         return true;
     } catch (e) {
@@ -219,9 +219,13 @@ if (Array.isArray(messages)) {
 
 function nextOwnerSeq(owner) {
     const key = owner || 'default';
-    ownerSeqCounters[key] = (ownerSeqCounters[key] || 0) + 1;
-    saveJson(OWNER_SEQUENCES_FILE, ownerSeqCounters);
-    return ownerSeqCounters[key];
+    const next = (ownerSeqCounters[key] || 0) + 1;
+    const candidate = Object.assign({}, ownerSeqCounters, { [key]: next });
+    if (!saveJson(OWNER_SEQUENCES_FILE, candidate)) {
+        throw new Error('Sequence persistence failed');
+    }
+    ownerSeqCounters = candidate;
+    return next;
 }
 
 function isPeerTombstoned(owner, peerId, timestamp) {
@@ -1201,7 +1205,7 @@ async function pollSingleAccount(target) {
 
             if (info.unreadCount > 0) {
                 lastPollStats.lastUnreadFound = info.unreadCount;
-                console.log(`[Cloud Poller:${target.key}] 👻 Unread private notification from ${info.name} (${peerId}): ${info.unreadCount} unread message(s) [Zero-Seen active]`);
+                console.log('[Cloud Poller] Private update detected (contact metadata omitted)');
 
                 const sockEntry = accountSockets.get(target.key);
                 if (!sockEntry || !sockEntry.connected || !sockEntry.socket || !sockEntry.socket.connected) {
@@ -1955,7 +1959,7 @@ app.get('/api/sync', requireAuth, (req, res) => {
     const rawAfterSeq = req.query.after_seq !== undefined ? req.query.after_seq : req.query.since_seq;
     const afterSeq = hasAfterSeq ? parseInt(rawAfterSeq, 10) : null;
     const clientEpoch = req.query.epoch ? String(req.query.epoch).trim() : null;
-    const epochMismatch = Boolean(clientEpoch && clientEpoch !== SERVER_EPOCH);
+    const epochMismatch = Boolean(clientEpoch && clientEpoch !== String(SERVER_EPOCH).trim());
 
     const ownerMessages = messages.filter(m => Boolean(m.owner) && m.owner === currentOwner);
     const currentSeq = ownerSeqCounters[currentOwner] || 0;
@@ -2024,8 +2028,9 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
     }
 
     const { device_id, ack_seq, epoch } = req.body || {};
-    if (!device_id) {
-        return res.status(400).json({ ok: false, error: 'Missing device_id' });
+    const safeDeviceId = typeof device_id === 'string' ? device_id.trim() : '';
+    if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(safeDeviceId)) {
+        return res.status(400).json({ ok: false, error: 'Invalid device_id' });
     }
 
     const parsedAckSeq = Number(ack_seq);
@@ -2051,7 +2056,7 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         });
     }
 
-    const prevAckSeq = Number(prevCursor.ack_seq) || 0;
+    const prevAckSeq = String(prevCursor.epoch) === String(SERVER_EPOCH) ? (Number(prevCursor.ack_seq) || 0) : 0;
     const finalAckSeq = Math.max(prevAckSeq, parsedAckSeq);
 
     const nextCursor = {

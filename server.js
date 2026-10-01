@@ -1829,7 +1829,7 @@ app.get('/', (req, res) => {
 
 // Health check for monitoring and uptime robots
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, status: 'healthy', uptime: Math.round(process.uptime()), service: 'ghost-cloud-relay' });
+    res.json({ ok: true, status: 'healthy', uptime: Math.round(process.uptime()), service: 'ghost-cloud-relay', build: 'relay-sync-v51-20261001' });
 });
 
 // 2. Status API

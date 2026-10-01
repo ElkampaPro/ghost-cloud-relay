@@ -352,6 +352,32 @@ function extractStableAccountId(cookies, utk, explicitUserId = null) {
     return null;
 }
 
+// Identity supplied by an authenticated enrollment is durable. Cookie-only
+// WebViews can lack an identity cookie, so PHPSESSID must not replace it later.
+function storedSessionIdentity(entry) {
+    if (!entry) return null;
+    return extractExplicitUserId(entry.cookies) || entry.userId ||
+        (/^\d+$/.test(String(entry.accountKey || '')) ? String(entry.accountKey) : null);
+}
+
+function reconcileOwnerSequenceHorizons() {
+    const candidate = Object.assign({}, ownerSeqCounters);
+    for (const [key, acc] of Object.entries(accountSessions)) {
+        for (const legacy of (acc.legacyKeys || [])) {
+            candidate[key] = Math.max(Number(candidate[key]) || 0, Number(candidate[legacy]) || 0);
+        }
+    }
+    for (const message of messages) {
+        if (message.owner && Number.isSafeInteger(message.seq) && message.seq >= 0) {
+            candidate[message.owner] = Math.max(Number(candidate[message.owner]) || 0, message.seq);
+        }
+    }
+    if (JSON.stringify(candidate) === JSON.stringify(ownerSeqCounters)) return true;
+    if (!saveJson(OWNER_SEQUENCES_FILE, candidate)) return false;
+    ownerSeqCounters = candidate;
+    return true;
+}
+
 // Account Sessions Registry (for multi-tenant and concurrent client session isolation)
 let accountSessions = loadJson(ACCOUNTS_FILE, {});
 
@@ -446,7 +472,7 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
     const keyMap = new Map(); // oldRawKey -> canonicalSafeKey
     for (const [key, acc] of Object.entries(accountSessions)) {
         if (!acc) continue;
-        const canonical = extractStableAccountId(acc.cookies, acc.utk) || acc.accountKey;
+        const canonical = extractStableAccountId(acc.cookies, acc.utk, storedSessionIdentity(acc)) || acc.accountKey;
         if (!canonical) continue;
         if (!Array.isArray(acc.legacyKeys)) acc.legacyKeys = [];
 
@@ -532,13 +558,18 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
 }
 
 
+if (!reconcileOwnerSequenceHorizons()) {
+    storageHealth = { ok: false, error: 'Owner sequence reconciliation persistence failure', lastIncident: new Date().toISOString() };
+}
+
 // 3. Startup reconciliation: Ensure bidirectional sync between sessionData and accountSessions
 function ensureSessionDataInAccounts() {
     if (sessionData && (sessionData.utk || sessionData.cookies)) {
-        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) || 'default_owner';
         if (!accountSessions[stableId]) {
             accountSessions[stableId] = {
                 accountKey: stableId,
+                userId: storedSessionIdentity(sessionData),
                 cookies: sessionData.cookies || '',
                 utk: sessionData.utk || '',
                 userAgent: sessionData.userAgent || '',
@@ -557,7 +588,7 @@ function ensureSessionDataInAccounts() {
 }
 
 if (accountSessions && typeof accountSessions === 'object' && Object.keys(accountSessions).length > 0) {
-    const currentSessionKey = extractStableAccountId(sessionData.cookies, sessionData.utk);
+    const currentSessionKey = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData));
     const activeAccounts = Object.values(accountSessions).filter(acc => acc && !acc.revoked && (acc.cookies || acc.utk));
 
     // If sessionData points to an uncommitted/orphaned account not in accountSessions:
@@ -640,8 +671,8 @@ function getOwnerId(req) {
                 }
             }
 
-            if (!tokenOwnerKey && sessionData && sessionData.utk && (sessionData.utk === cleanToken || extractStableAccountId(sessionData.cookies, sessionData.utk) === cleanToken)) {
-                tokenOwnerKey = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+            if (!tokenOwnerKey && sessionData && sessionData.utk && (sessionData.utk === cleanToken || extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) === cleanToken)) {
+                tokenOwnerKey = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) || 'default_owner';
             }
 
             if (tokenOwnerKey) {
@@ -754,7 +785,7 @@ function getOwnerId(req) {
 
     // 2. Default to active sessionData on the server ONLY for internal background operations
     if (sessionData) {
-        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk);
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData));
         if (stableId) return stableId;
     }
 
@@ -1099,7 +1130,7 @@ function initChatSocket() {
 
     // 3. Fallback: if no registered accounts in accountSessions but sessionData has credentials
     if (!connectedAny && sessionData && sessionData.cookies && sessionData.utk) {
-        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+        const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) || 'default_owner';
         connectAccountSocket(stableId, sessionData.cookies, sessionData.utk, sessionData.userAgent);
     }
 }
@@ -1285,7 +1316,7 @@ function startPollingEngine() {
 
         // Fallback for single sessionData if accountSessions has no active targets
         if (!hasActiveTarget && sessionData && sessionData.cookies && sessionData.utk) {
-            const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk) || 'default_owner';
+            const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) || 'default_owner';
             const entry = accountSockets.get(stableId);
             const isConnecting = entry && entry.connecting && (Date.now() - (entry.connectingStartedAt || 0) < 12000);
             if (!isConnecting && (!entry || !entry.connected || !entry.socket || !entry.socket.connected)) {
@@ -2449,7 +2480,7 @@ function performRevocation(req, res) {
     }
 
     // Adjust active server sessionData
-    const currentSessionKey = sessionData ? extractStableAccountId(sessionData.cookies, sessionData.utk) : null;
+    const currentSessionKey = sessionData ? extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) : null;
     if (!sessionData) {
         sessionData = { cookies: '', utk: '', userAgent: '', lastUpdated: new Date().toISOString() };
     } else if (currentSessionKey === targetKey || !targetKey || Object.values(accountSessions).filter(a => !a.revoked).length === 0) {
@@ -2796,6 +2827,9 @@ app.post('/api/session', requireAuth, (req, res) => {
         if (candidateUserAgent !== sessionData.userAgent) {
             changed = true;
         }
+        if (sessionData.accountKey !== accKey || storedSessionIdentity(sessionData) !== (incomingUserId ? String(incomingUserId).trim() : null)) {
+            changed = true;
+        }
     }
 
     if (changed) {
@@ -2806,6 +2840,8 @@ app.post('/api/session', requireAuth, (req, res) => {
 
         sessionData = {
             cookies: candidateCookies,
+            userId: incomingUserId ? String(incomingUserId).trim() : null,
+            accountKey: accKey,
             utk: candidateUtk,
             userAgent: candidateUserAgent,
             lastUpdated: new Date().toISOString()
@@ -2814,9 +2850,9 @@ app.post('/api/session', requireAuth, (req, res) => {
         // 1. Prepare in-memory updates for accountSessions & messages
         let migrated = false;
         if (accKey) {
-            const prevAccKey = prevSession ? extractStableAccountId(prevSession.cookies, prevSession.utk) : null;
-            const prevUserId = prevSession ? extractExplicitUserId(prevSession.cookies) : null;
-            const currentUserId = extractExplicitUserId(sessionData.cookies);
+            const prevAccKey = prevSession ? extractStableAccountId(prevSession.cookies, prevSession.utk, storedSessionIdentity(prevSession)) : null;
+            const prevUserId = storedSessionIdentity(prevSession);
+            const currentUserId = storedSessionIdentity(sessionData);
             const isDifferentUser = Boolean(prevUserId && currentUserId && prevUserId !== currentUserId);
 
             const isSameAccountRenewal = Boolean(prevSession && prevSession.utk && sessionData.utk &&
@@ -2849,6 +2885,7 @@ app.post('/api/session', requireAuth, (req, res) => {
             if (isSameAccountRenewal && renewalSourceKey && accountSessions[renewalSourceKey]) {
                 accountSessions[accKey] = accountSessions[renewalSourceKey];
                 accountSessions[accKey].accountKey = accKey;
+                accountSessions[accKey].userId = storedSessionIdentity(sessionData);
                 accountSessions[accKey].cookies = sessionData.cookies;
                 accountSessions[accKey].utk = sessionData.utk;
                 accountSessions[accKey].userAgent = sessionData.userAgent;
@@ -2880,6 +2917,7 @@ app.post('/api/session', requireAuth, (req, res) => {
             } else if (!accountSessions[accKey]) {
                 accountSessions[accKey] = {
                     accountKey: accKey,
+                    userId: storedSessionIdentity(sessionData),
                     cookies: sessionData.cookies,
                     utk: sessionData.utk,
                     userAgent: sessionData.userAgent,
@@ -2891,6 +2929,7 @@ app.post('/api/session', requireAuth, (req, res) => {
                 };
             } else {
                 accountSessions[accKey].revoked = false;
+                accountSessions[accKey].userId = storedSessionIdentity(sessionData);
                 accountSessions[accKey].cookies = sessionData.cookies;
                 accountSessions[accKey].utk = sessionData.utk;
                 accountSessions[accKey].userAgent = sessionData.userAgent;
@@ -3123,6 +3162,9 @@ app.post('/api/session', requireAuth, (req, res) => {
         }
     }
 
+    if (!reconcileOwnerSequenceHorizons()) {
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to preserve account sequence horizon' });
+    }
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
     const cookieKeys = sessionData.cookies ? sessionData.cookies.split(';').map(c => c.trim().split('=')[0]).filter(Boolean) : [];
     const hasAuthCookies = Boolean(

@@ -1934,6 +1934,20 @@ app.get('/api/status', (req, res) => {
     }
 
     const relevantMessages = targetKey ? messages.filter(m => m.owner === targetKey) : messages;
+    const rawDeviceId = req.query && req.query.device_id;
+    const deviceId = typeof rawDeviceId === 'string' ? rawDeviceId.trim() : '';
+    if (rawDeviceId !== undefined && !/^[a-zA-Z0-9._:-]{1,128}$/.test(deviceId)) {
+        return res.status(400).json({ ok: false, error: 'Invalid device_id' });
+    }
+    const currentSeq = targetKey ? (ownerSeqCounters[targetKey] || 0) : null;
+    const cursor = targetKey && deviceId ? deviceCursors[`${targetKey}:${deviceId}`] : null;
+    const ackEpochMatches = Boolean(cursor && String(cursor.epoch) === String(SERVER_EPOCH));
+    const deviceAckSeq = targetKey && deviceId
+        ? (ackEpochMatches && Number.isSafeInteger(cursor.ack_seq) && cursor.ack_seq >= 0 && cursor.ack_seq <= currentSeq ? cursor.ack_seq : 0)
+        : null;
+    const pendingForDevice = deviceAckSeq === null ? null
+        : relevantMessages.filter(m => Number.isSafeInteger(m.seq) && m.seq > deviceAckSeq).length;
+    const legacyUnsyncedCount = relevantMessages.filter(m => !m.synced).length;
 
     res.json({
         ok: true,
@@ -1962,7 +1976,14 @@ app.get('/api/status', (req, res) => {
         lastPollStatus: lastPollStats.status,
         lastPollCycles: lastPollStats.totalCycles,
         totalMessages: relevantMessages.length,
-        unsyncedCount: relevantMessages.filter(m => !m.synced).length
+        // Legacy flags are not delivery receipts. With a device, count only
+        // retained rows after its durable ACK, within this account and epoch.
+        unsyncedCount: pendingForDevice === null ? legacyUnsyncedCount : pendingForDevice,
+        legacyUnsyncedCount,
+        pendingForDevice,
+        deviceAckSeq,
+        current_seq: currentSeq,
+        epoch: SERVER_EPOCH
     });
 });
 
@@ -2099,6 +2120,12 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
     const prevAckSeq = String(prevCursor.epoch) === String(SERVER_EPOCH) ? (Number(prevCursor.ack_seq) || 0) : 0;
     const finalAckSeq = Math.max(prevAckSeq, parsedAckSeq);
 
+    // Retrying an already committed ACK must not rewrite the cursor file.
+    if (String(prevCursor.epoch) === String(SERVER_EPOCH) && prevAckSeq === finalAckSeq) {
+        return res.json({ ok: true, device_id: safeDeviceId, ack_seq: finalAckSeq,
+            epoch: SERVER_EPOCH, epoch_mismatch: false, current_seq: currentOwnerSeq });
+    }
+
     const nextCursor = {
         ack_seq: finalAckSeq,
         last_sync: Date.now(),
@@ -2114,7 +2141,7 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
     res.json({
         ok: true,
         device_id: safeDeviceId,
-        ack_seq: parsedAckSeq,
+        ack_seq: finalAckSeq,
         epoch: SERVER_EPOCH,
         epoch_mismatch: epochMismatch,
         current_seq: ownerSeqCounters[currentOwner] || 0

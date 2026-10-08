@@ -1399,6 +1399,32 @@ function startPollingEngine() {
     }, 3000);
 }
 
+// CORS Configuration for Web and Mobile WebView
+const corsOptions = {
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.has(origin) || origin.includes('arabic.chat') || origin === 'null') {
+            return callback(null, true);
+        }
+        return callback(null, true);
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'x-ghost-secret',
+        'x-ghost-token',
+        'x-ghost-user-id',
+        'x-ghost-account-key',
+        'x-ghost-device-id',
+        'x-ghost-recovery-key'
+    ],
+    exposedHeaders: ['x-ghost-epoch', 'x-ghost-seq'],
+    credentials: true,
+    maxAge: 86400
+};
+app.use(cors(corsOptions));
+
 // Middleware
 const apiRequestBudget = createRequestBudget();
 app.use('/api', (req, res, next) => {

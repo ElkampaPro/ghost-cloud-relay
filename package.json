@@ -5,7 +5,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check request-budget.js && node --check storage-codec.js",
+    "test": "npm run check && node tests/stable_session_identity.cjs && node tests/storage_codec.cjs && node tests/request_budget.cjs"
+  },
+  "engines": {
+    "node": ">=22 <25"
   },
   "keywords": [
     "ghost",

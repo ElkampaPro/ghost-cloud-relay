@@ -3,11 +3,16 @@ services:
     name: ghost-cloud-relay
     runtime: node
     plan: free
-    autoDeploy: true
-    buildCommand: npm install
-    startCommand: node server.js
+    autoDeployTrigger: commit
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
+      - key: NODE_VERSION
+        value: 22
       - key: GHOST_SECRET
+        generateValue: true
+      - key: GHOST_STORAGE_KEY
         generateValue: true
       - key: SITE_URL
         value: https://www.arabic.chat

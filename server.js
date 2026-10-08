@@ -5,14 +5,27 @@ const path = require('path');
 const { timingSafeEqual } = require('crypto');
 const { io } = require('socket.io-client');
 require('dotenv').config();
+const { createStorageCodec } = require('./storage-codec');
+const { createRequestBudget } = require('./request-budget');
+const storageCodec = createStorageCodec(process.env.GHOST_STORAGE_KEY || '');
 
-// Prevent crashes on any unhandled errors
-process.on('uncaughtException', (err) => {
-    console.warn('[Process] Caught exception:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-    console.warn('[Process] Unhandled Rejection:', reason);
-});
+// A process that reached an uncaught failure may hold partially-mutated state.
+// Fail fast so the platform can restart a clean instance instead of serving
+// requests from an unknown state.
+let fatalExitScheduled = false;
+function scheduleFatalExit(kind, error) {
+    const message = error && error.message ? error.message : String(error || 'unknown error');
+    console.error(`[Process] ${kind}: ${message}`);
+    if (fatalExitScheduled) return;
+    fatalExitScheduled = true;
+    process.exitCode = 1;
+    const timer = setTimeout(() => {
+        if (typeof process.exit === 'function') process.exit(1);
+    }, 100);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+}
+process.on('uncaughtException', (err) => scheduleFatalExit('Uncaught exception', err));
+process.on('unhandledRejection', (reason) => scheduleFatalExit('Unhandled rejection', reason));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,6 +35,10 @@ if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') {
 }
 const SITE_URL = process.env.SITE_URL || 'https://www.arabic.chat';
 const SOCKET_PATH = process.env.SOCKET_PATH || '/io/';
+const ALLOWED_ORIGINS = new Set(
+    String(process.env.ALLOWED_ORIGINS || `${SITE_URL},https://arabic.chat,https://www.arabic.chat`)
+        .split(',').map(v => v.trim()).filter(Boolean)
+);
 
 // Ensure data folder exists (configurable via DATA_DIR for persistent volume mounts e.g. /data on Render)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -63,7 +80,7 @@ function loadJson(file, defVal) {
     try {
         if (fs.existsSync(file)) {
             const data = fs.readFileSync(file, 'utf8');
-            return JSON.parse(data);
+            return storageCodec.decode(path.basename(file), data);
         }
     } catch (e) {
         console.error(`[Storage] CRITICAL: Failed to parse ${file}: ${e.message}. Preserving original file to avoid data loss.`);
@@ -72,6 +89,9 @@ function loadJson(file, defVal) {
             fs.copyFileSync(file, backup);
             console.warn(`[Storage] Corrupt file backed up to ${backup}`);
         } catch (bErr) {}
+        // A bad key or corrupt file must never boot an empty store which could
+        // subsequently overwrite the user's original data.
+        throw new Error('Stored data could not be authenticated or parsed; startup aborted');
     }
     return defVal;
 }
@@ -84,7 +104,7 @@ function saveJson(file, data) {
             fs.mkdirSync(dir, { recursive: true });
         }
         tmpFile = path.join(dir, `.tmp_${path.basename(file)}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`);
-        fs.writeFileSync(tmpFile, JSON.stringify(data), 'utf8');
+        fs.writeFileSync(tmpFile, storageCodec.encode(path.basename(file), data), { encoding: 'utf8', mode: 0o600 });
         fs.renameSync(tmpFile, file);
         return true;
     } catch (e) {
@@ -1139,6 +1159,8 @@ function initChatSocket() {
 // 24/7 Background HTTP Poller Engine
 // ==========================================
 let pollIntervalTimer = null;
+let pollStartTimer = null;
+let pollWatchdogTimer = null;
 let isPollingActive = false;
 let lastPollStats = {
     lastPollTime: null,
@@ -1147,6 +1169,30 @@ let lastPollStats = {
     totalCycles: 0,
     lastError: null
 };
+
+// A heartbeat owns its response and cannot overlap another for the same account.
+const accountHeartbeats = new Map();
+const accountPollSchedule = new Map();
+function scheduleAccountHeartbeat(target, headers) {
+    if (!target.utk) return Promise.resolve();
+    const previous = accountHeartbeats.get(target.key);
+    if (previous && (previous.pending || Date.now() - previous.startedAt < 30000)) return previous.pending || Promise.resolve();
+    const entry = { startedAt: Date.now(), pending: null };
+    const task = (async () => {
+        try {
+            const response = await fetch(`${SITE_URL}/system/chat_log.php`, {
+                method: 'POST', headers,
+                body: `fload=0&caction=0&taction=0&last=0&snum=0&preload=0&priv=0&lastp=0&pcount=0&room=1&notify=0&token=${encodeURIComponent(target.utk)}&r=${Date.now()}`,
+                signal: AbortSignal.timeout(10000)
+            });
+            // This request is a keep-alive, not a history reader. Release its body.
+            if (response.body && typeof response.body.cancel === 'function') await response.body.cancel();
+        } catch (_) {} finally { entry.pending = null; }
+    })();
+    entry.pending = task;
+    accountHeartbeats.set(target.key, entry);
+    return task;
+}
 
 async function pollSingleAccount(target) {
     if (!target.cookies && !target.utk) return;
@@ -1173,21 +1219,13 @@ async function pollSingleAccount(target) {
             signal: AbortSignal.timeout(10000)
         });
 
-        // 1.1 Zero-Seen Keep-Alive Heartbeat (priv=0 ensures no message is marked read)
-        if (target.utk) {
-            try {
-                fetch(`${SITE_URL}/system/chat_log.php`, {
-                    method: 'POST',
-                    headers: headers,
-                    body: `fload=0&caction=0&taction=0&last=0&snum=0&preload=0&priv=0&lastp=0&pcount=0&room=1&notify=0&token=${encodeURIComponent(target.utk)}&r=${Date.now()}`,
-                    signal: AbortSignal.timeout(10000)
-                }).catch(() => {});
-            } catch (err) {}
-        }
+        // Preserve the site's existing priv=0 contract; do not infer a
+        // platform-wide read-receipt guarantee from this parameter alone.
+        scheduleAccountHeartbeat(target, headers);
 
         if (!notifyRes.ok) {
             lastPollStats.status = `HTTP_${notifyRes.status}`;
-            return;
+            return false;
         }
 
         const notifyHtml = await notifyRes.text();
@@ -1195,7 +1233,7 @@ async function pollSingleAccount(target) {
         lastPollStats.totalCycles++;
         lastPollStats.status = 'ok';
 
-        if (!notifyHtml || notifyHtml.trim().length === 0) return;
+        if (!notifyHtml || notifyHtml.trim().length === 0) return true;
 
         // 2. Parse contacts from notifyHtml
         const rawBlocks = notifyHtml.split(/(?=<div[^>]*class="[^"]*ulist_item)/i);
@@ -1248,9 +1286,11 @@ async function pollSingleAccount(target) {
                 }
             }
         }
+        return true;
     } catch (err) {
         lastPollStats.lastError = err.message;
         console.warn(`[Cloud Poller:${target.key}] Polling cycle error:`, err.message);
+        return false;
     }
 }
 
@@ -1274,8 +1314,19 @@ async function pollArabicChatOnce() {
 
     try {
         for (const target of targets) {
-            await pollSingleAccount(target);
+            const schedule = accountPollSchedule.get(target.key) || { failures: 0, nextAt: 0 };
+            if (Date.now() < schedule.nextAt) continue;
+            const ok = await pollSingleAccount(target);
+            schedule.failures = ok ? 0 : Math.min(schedule.failures + 1, 5);
+            const socket = accountSockets.get(target.key);
+            const delay = ok ? (socket && socket.connected ? 15000 : 2500)
+                : Math.min(60000, 2500 * Math.pow(2, schedule.failures));
+            schedule.nextAt = Date.now() + Math.round(delay * (0.9 + Math.random() * 0.2));
+            accountPollSchedule.set(target.key, schedule);
         }
+        const active = new Set(targets.map(target => target.key));
+        for (const key of accountPollSchedule.keys()) if (!active.has(key)) accountPollSchedule.delete(key);
+        for (const [key, heartbeat] of accountHeartbeats) if (!active.has(key) && !heartbeat.pending) accountHeartbeats.delete(key);
     } finally {
         isPollingActive = false;
     }
@@ -1283,12 +1334,14 @@ async function pollArabicChatOnce() {
 
 function startPollingEngine() {
     if (pollIntervalTimer) clearInterval(pollIntervalTimer);
-    console.log('[Cloud Poller] Starting 24/7 background polling engine (ultra-vigilant: 2.5s)...');
-    setTimeout(pollArabicChatOnce, 1000);
+    if (pollStartTimer) clearTimeout(pollStartTimer);
+    if (pollWatchdogTimer) clearInterval(pollWatchdogTimer);
+    console.log('[Cloud Poller] Starting account-aware polling scheduler...');
+    pollStartTimer = setTimeout(pollArabicChatOnce, 1000);
     pollIntervalTimer = setInterval(pollArabicChatOnce, 2500);
 
     // 3-second Active Socket Watchdog (Rapid Per-Account Recovery)
-    setInterval(() => {
+    pollWatchdogTimer = setInterval(() => {
         const hasSessionCreds = Boolean(sessionData && (sessionData.cookies || sessionData.utk));
         const hasActiveAccounts = Object.values(accountSessions).some(a => !a.revoked && a.cookies && a.utk);
         if (!hasSessionCreds && !hasActiveAccounts) {
@@ -1328,7 +1381,27 @@ function startPollingEngine() {
 }
 
 // Middleware
-app.use(cors({ origin: '*' }));
+if (typeof app.set === 'function') app.set('trust proxy', 1);
+app.use(cors({
+    origin(origin, callback) {
+        // Native clients and server-to-server requests normally omit Origin.
+        // Browser clients are limited to the chat site and extension origins.
+        if (!origin || ALLOWED_ORIGINS.has(origin) || /^chrome-extension:\/\/[a-p]{32}$/i.test(origin)) {
+            return callback(null, true);
+        }
+        return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-Ghost-Secret', 'X-Ghost-Token', 'X-Ghost-User-Id', 'X-Ghost-Account-Key', 'X-Ghost-Session']
+}));
+const apiRequestBudget = createRequestBudget();
+app.use('/api', (req, res, next) => {
+    req.ghostAuthenticated = checkAuth(req);
+    apiRequestBudget(req, res, next);
+});
+app.use('/api/session', express.json({ limit: '64kb' }));
+app.use('/api/messages/sent', express.json({ limit: '256kb' }));
+app.use('/api/messages/incoming', express.json({ limit: '256kb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1865,7 +1938,20 @@ app.get('/', (req, res) => {
 
 // Health check for monitoring and uptime robots
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, status: 'healthy', uptime: Math.round(process.uptime()), service: 'ghost-cloud-relay', build: 'relay-sync-v51-20261001' });
+    const secretReady = Boolean(GHOST_SECRET && GHOST_SECRET !== 'ghost_secret_2026');
+    const transactionPending = fs.existsSync(TRANSACTION_FILE);
+    const ready = secretReady && storageHealth.ok && !transactionPending && !fatalExitScheduled;
+    res.status(ready ? 200 : 503).json({
+        ok: ready,
+        status: ready ? 'healthy' : 'degraded',
+        uptime: Math.round(process.uptime()),
+        service: 'ghost-cloud-relay',
+        build: 'relay-sync-v52-20261008',
+        checks: {
+            secretConfigured: secretReady,
+            storageReady: Boolean(storageHealth.ok && !transactionPending)
+        }
+    });
 });
 
 // 2. Status API
@@ -3327,7 +3413,8 @@ app.post('/api/clear', requireAuth, (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, '0.0.0.0', () => {
+let selfPingTimer = null;
+const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`=================================================`);
     console.log(`👻 Ghost Cloud Relay Server is RUNNING on port ${PORT}`);
     console.log(`🔒 Secret Key: configured (${GHOST_SECRET.length} chars)`);
@@ -3340,7 +3427,34 @@ app.listen(PORT, '0.0.0.0', () => {
 
     // Render Free Tier Keep-Alive: Ping self every 90 seconds to prevent sleeping
     const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://ghost-cloud-relay.onrender.com';
-    setInterval(() => {
-        fetch(`${SELF_URL}/api/status`).catch(() => {});
+    selfPingTimer = setInterval(() => {
+        fetch(`${SELF_URL}/api/health`, { signal: AbortSignal.timeout(10000) }).catch(() => {});
     }, 90 * 1000);
 });
+
+let gracefulShutdownStarted = false;
+function gracefulShutdown(signal) {
+    if (gracefulShutdownStarted) return;
+    gracefulShutdownStarted = true;
+    console.log(`[Process] ${signal} received; closing listeners and sockets.`);
+    if (pollStartTimer) clearTimeout(pollStartTimer);
+    if (pollIntervalTimer) clearInterval(pollIntervalTimer);
+    if (pollWatchdogTimer) clearInterval(pollWatchdogTimer);
+    if (selfPingTimer) clearInterval(selfPingTimer);
+    for (const entry of accountSockets.values()) {
+        try { if (entry && entry.socket) entry.socket.disconnect(); } catch (_) {}
+    }
+    const finish = () => {
+        try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (_) {}
+        if (typeof process.exit === 'function') process.exit(0);
+    };
+    if (httpServer && typeof httpServer.close === 'function') {
+        const forceTimer = setTimeout(finish, 5000);
+        if (forceTimer && typeof forceTimer.unref === 'function') forceTimer.unref();
+        httpServer.close(finish);
+    } else {
+        finish();
+    }
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

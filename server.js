@@ -330,6 +330,22 @@ let lastConnectedTime = null;
 let lastError = null;
 let socketConnectingStartedAt = null;
 
+function areCookiesEquivalent(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return (!a && !b);
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const normalize = str => str.split(';').map(s => s.trim()).filter(Boolean).sort().join('; ');
+    if (normalize(a) === normalize(b)) return true;
+    const phpA = a.match(/PHPSESSID=([^;]+)/i)?.[1]?.trim();
+    const phpB = b.match(/PHPSESSID=([^;]+)/i)?.[1]?.trim();
+    if (phpA && phpB && phpA === phpB) {
+        const uidA = extractExplicitUserId(a);
+        const uidB = extractExplicitUserId(b);
+        if (uidA === uidB) return true;
+    }
+    return false;
+}
+
 function extractExplicitUserId(cookies) {
     if (cookies && typeof cookies === 'string') {
         const u = cookies.match(/(?:user_id|my_id)=([^;]+)/i);
@@ -952,9 +968,12 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
 
     if (accountSockets.has(accKey)) {
         const existing = accountSockets.get(accKey);
-        const credentialsMatch = existing.cookies === cookies && existing.utk === utk;
+        const credentialsMatch = existing.utk === utk && areCookiesEquivalent(existing.cookies, cookies);
 
         if (credentialsMatch && existing.socket) {
+            if (cookies && existing.cookies !== cookies) {
+                existing.cookies = cookies;
+            }
             // 1. If live and connected, return existing live socket
             if (existing.socket.connected && existing.connected) {
                 existing.connecting = false;
@@ -1381,19 +1400,6 @@ function startPollingEngine() {
 }
 
 // Middleware
-if (typeof app.set === 'function') app.set('trust proxy', 1);
-app.use(cors({
-    origin(origin, callback) {
-        // Native clients and server-to-server requests normally omit Origin.
-        // Browser clients are limited to the chat site and extension origins.
-        if (!origin || ALLOWED_ORIGINS.has(origin) || /^chrome-extension:\/\/[a-p]{32}$/i.test(origin)) {
-            return callback(null, true);
-        }
-        return callback(null, false);
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'X-Ghost-Secret', 'X-Ghost-Token', 'X-Ghost-User-Id', 'X-Ghost-Account-Key', 'X-Ghost-Session']
-}));
 const apiRequestBudget = createRequestBudget();
 app.use('/api', (req, res, next) => {
     req.ghostAuthenticated = checkAuth(req);
@@ -2715,7 +2721,9 @@ app.post('/api/session', requireAuth, (req, res) => {
     }
 
     const candidateUtk = utk !== undefined ? (typeof utk === 'string' ? utk.trim() : '') : (prevSession ? prevSession.utk : '');
-    const candidateUserAgent = userAgent !== undefined ? userAgent : (prevSession ? prevSession.userAgent : '');
+    const candidateUserAgent = (userAgent !== undefined && typeof userAgent === 'string' && userAgent.trim())
+        ? userAgent.trim()
+        : (prevSession ? prevSession.userAgent : '');
 
     let candidateCookies = '';
     if (cookies !== undefined) {
@@ -2931,17 +2939,26 @@ app.post('/api/session', requireAuth, (req, res) => {
     if (!sessionData) {
         changed = true;
     } else {
-        if (candidateCookies !== sessionData.cookies) {
+        if (!areCookiesEquivalent(candidateCookies, sessionData.cookies)) {
             changed = true;
         }
         if (candidateUtk !== sessionData.utk) {
             changed = true;
         }
-        if (candidateUserAgent !== sessionData.userAgent) {
+        if (candidateUserAgent && sessionData.userAgent && candidateUserAgent !== sessionData.userAgent) {
             changed = true;
         }
         if (sessionData.accountKey !== accKey || storedSessionIdentity(sessionData) !== (incomingUserId ? String(incomingUserId).trim() : null)) {
             changed = true;
+        }
+    }
+
+    if (!changed) {
+        if (candidateCookies && candidateCookies !== sessionData.cookies) {
+            sessionData.cookies = candidateCookies;
+            if (accKey && accountSessions[accKey]) {
+                accountSessions[accKey].cookies = candidateCookies;
+            }
         }
     }
 

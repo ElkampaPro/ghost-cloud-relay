@@ -36,8 +36,9 @@ if (!GHOST_SECRET || GHOST_SECRET === 'ghost_secret_2026') {
 }
 const SITE_URL = process.env.SITE_URL || 'https://www.arabic.chat';
 const SOCKET_PATH = process.env.SOCKET_PATH || '/io/';
+const PACKAGED_EXTENSION_ORIGIN = 'chrome-extension://jcjomphigiocbjjkpfilpmkpcoghabii';
 const ALLOWED_ORIGINS = new Set(
-    String(process.env.ALLOWED_ORIGINS || `${SITE_URL},https://arabic.chat,https://www.arabic.chat`)
+    String(process.env.ALLOWED_ORIGINS || `${SITE_URL},https://arabic.chat,https://www.arabic.chat,${PACKAGED_EXTENSION_ORIGIN}`)
         .split(',').map(v => v.trim()).filter(Boolean)
 );
 

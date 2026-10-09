@@ -1984,7 +1984,7 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v53-20261009',
+        build: 'relay-sync-v54-20261009',
         checks: {
             secretConfigured: secretReady,
             storageReady: Boolean(storageHealth.ok && !transactionPending)

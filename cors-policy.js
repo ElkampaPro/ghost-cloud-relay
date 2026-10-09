@@ -1,12 +1,15 @@
 'use strict';
 
-const EXTENSION_ORIGIN_RE = /^chrome-extension:\/\/[a-p]{32}$/i;
-
 function normalizeOrigin(value) {
     if (typeof value !== 'string' || !value.trim()) return null;
     try {
         const url = new URL(value.trim());
-        if (url.protocol !== 'https:' && url.protocol !== 'http:' && url.protocol !== 'chrome-extension:') {
+        if (url.protocol === 'chrome-extension:') {
+            return /^[a-p]{32}$/i.test(url.hostname)
+                ? `chrome-extension://${url.hostname.toLowerCase()}`
+                : null;
+        }
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') {
             return null;
         }
         return url.origin.toLowerCase();
@@ -27,7 +30,6 @@ function createCorsOriginChecker(allowedOrigins, options = {}) {
         // Native clients and server-to-server calls normally omit Origin.
         if (!origin) return true;
         if (origin === 'null') return allowNullOrigin;
-        if (EXTENSION_ORIGIN_RE.test(origin)) return true;
         const normalized = normalizeOrigin(origin);
         return Boolean(normalized && normalizedAllowed.has(normalized));
     };

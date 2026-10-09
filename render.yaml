@@ -18,3 +18,5 @@ services:
         value: https://www.arabic.chat
       - key: SOCKET_PATH
         value: /io/
+      - key: ALLOWED_ORIGINS
+        value: https://www.arabic.chat,https://arabic.chat,chrome-extension://jcjomphigiocbjjkpfilpmkpcoghabii

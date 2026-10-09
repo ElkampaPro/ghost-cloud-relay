@@ -5,13 +5,15 @@ const { createCorsOriginChecker, normalizeOrigin } = require('../cors-policy');
 
 const isAllowed = createCorsOriginChecker(new Set([
     'https://arabic.chat',
-    'https://www.arabic.chat'
+    'https://www.arabic.chat',
+    'chrome-extension://jcjomphigiocbjjkpfilpmkpcoghabii'
 ]));
 
 assert.equal(isAllowed(undefined), true, 'Native requests without Origin must remain supported');
 assert.equal(isAllowed('https://arabic.chat'), true);
 assert.equal(isAllowed('https://www.arabic.chat'), true);
-assert.equal(isAllowed('chrome-extension://abcdefghijklmnopabcdefghijklmnop'), true);
+assert.equal(isAllowed('chrome-extension://jcjomphigiocbjjkpfilpmkpcoghabii'), true);
+assert.equal(isAllowed('chrome-extension://abcdefghijklmnopabcdefghijklmnop'), false);
 
 assert.equal(isAllowed('https://evil.example'), false);
 assert.equal(isAllowed('https://arabic.chat.evil.example'), false);

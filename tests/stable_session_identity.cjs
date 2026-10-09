@@ -28,6 +28,7 @@ const c = {Buffer,
     if (n === 'socket.io-client') return { io() { return { on() {}, onAny() {}, removeAllListeners() {}, disconnect() {} }; } };
     if (n === './storage-codec') return require('../storage-codec');
     if (n === './request-budget') return require('../request-budget');
+    if (n === './cors-policy') return require('../cors-policy');
     throw Error(n);
   },
   __dirname: root,

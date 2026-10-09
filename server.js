@@ -7,6 +7,7 @@ const { io } = require('socket.io-client');
 require('dotenv').config();
 const { createStorageCodec } = require('./storage-codec');
 const { createRequestBudget } = require('./request-budget');
+const { createCorsOriginChecker } = require('./cors-policy');
 const storageCodec = createStorageCodec(process.env.GHOST_STORAGE_KEY || '');
 
 // A process that reached an uncaught failure may hold partially-mutated state.
@@ -1399,16 +1400,17 @@ function startPollingEngine() {
     }, 3000);
 }
 
-// CORS Configuration for Web and Mobile WebView
+// CORS configuration for the chat website, packaged extension, and native clients.
+// Requests without Origin are native/server-to-server. Opaque origins stay denied
+// unless the deployment explicitly opts in with ALLOW_NULL_ORIGIN=true.
+const isAllowedCorsOrigin = createCorsOriginChecker(ALLOWED_ORIGINS, {
+    allowNullOrigin: process.env.ALLOW_NULL_ORIGIN === 'true'
+});
 const corsOptions = {
     origin: function (origin, callback) {
-        if (!origin) return callback(null, true);
-        if (ALLOWED_ORIGINS.has(origin) || origin.includes('arabic.chat') || origin === 'null') {
-            return callback(null, true);
-        }
-        return callback(null, true);
+        return callback(null, isAllowedCorsOrigin(origin));
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: [
         'Content-Type',
         'Authorization',
@@ -1417,12 +1419,16 @@ const corsOptions = {
         'x-ghost-user-id',
         'x-ghost-account-key',
         'x-ghost-device-id',
-        'x-ghost-recovery-key'
+        'x-ghost-recovery-key',
+        'x-ghost-admin-key',
+        'x-ghost-session',
+        'x-ghost-epoch'
     ],
     exposedHeaders: ['x-ghost-epoch', 'x-ghost-seq'],
     credentials: true,
     maxAge: 86400
 };
+if (typeof app.set === 'function') app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 
 // Middleware
@@ -1978,7 +1984,7 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v52-20261008',
+        build: 'relay-sync-v53-20261009',
         checks: {
             secretConfigured: secretReady,
             storageReady: Boolean(storageHealth.ok && !transactionPending)

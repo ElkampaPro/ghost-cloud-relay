@@ -6,8 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check request-budget.js && node --check storage-codec.js",
-    "test": "npm run check && node tests/stable_session_identity.cjs && node tests/storage_codec.cjs && node tests/request_budget.cjs"
+    "check": "node --check server.js && node --check request-budget.js && node --check storage-codec.js && node --check cors-policy.js",
+    "test": "npm run check && node tests/stable_session_identity.cjs && node tests/test_idempotent_session_sync.cjs && node tests/storage_codec.cjs && node tests/request_budget.cjs && node tests/cors_policy.cjs"
   },
   "engines": {
     "node": ">=22 <25"

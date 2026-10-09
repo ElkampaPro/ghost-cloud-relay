@@ -1439,6 +1439,7 @@ app.use('/api', (req, res, next) => {
     apiRequestBudget(req, res, next);
 });
 app.use('/api/session', express.json({ limit: '64kb' }));
+app.use('/api/messages/batch', express.json({ limit: '1mb' }));
 app.use('/api/messages/sent', express.json({ limit: '256kb' }));
 app.use('/api/messages/incoming', express.json({ limit: '256kb' }));
 app.use(express.json({ limit: '10mb' }));
@@ -2271,6 +2272,87 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         epoch_mismatch: epochMismatch,
         current_seq: ownerSeqCounters[currentOwner] || 0
     });
+});
+
+// 4. Record a bounded group of queued messages with one durable write.
+// Deletions stay on their transactional endpoint and are never mixed into a batch.
+app.post('/api/messages/batch', requireAuth, (req, res) => {
+    const rows = req.body && req.body.items;
+    if (!Array.isArray(rows) || rows.length < 1 || rows.length > 50) {
+        return res.status(400).json({ ok: false, error: 'items must contain between 1 and 50 messages' });
+    }
+    const currentOwner = getOwnerId(req);
+    if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
+    }
+
+    const prepared = [];
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        const message = row && row.message;
+        const direction = row && row.type;
+        if (!row || !row.peerId || !message || !['sent', 'incoming'].includes(direction)) {
+            return res.status(400).json({ ok: false, error: `Invalid message at index ${index}` });
+        }
+        const safePeerId = String(row.peerId).replace(/["'<>]/g, '').slice(0, 64);
+        if (!safePeerId) {
+            return res.status(400).json({ ok: false, error: `Invalid peerId at index ${index}` });
+        }
+        const sent = direction === 'sent';
+        prepared.push({
+            id: message.id || (`msg_${sent ? 'sent' : 'in'}_` + Date.now() + '_' + index + '_' + Math.random().toString(36).slice(2, 7)),
+            peerId: safePeerId,
+            name: row.name || ('مستخدم ' + safePeerId),
+            avatar: message.avatar || 'default_images/avatar/default_avatar.png',
+            text: message.text || stripHtml(message.html || ''),
+            html: message.html || message.text || '',
+            time: message.time || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+            timestamp: message.timestamp || Date.now(),
+            type: sent ? 'sent' : 'received',
+            synced: true,
+            owner: currentOwner
+        });
+    }
+
+    const accepted = [];
+    const inserted = [];
+    const tombstoned = [];
+    let candidate = messages;
+    const previousCounters = ownerSeqCounters;
+    let nextSeq = Number(ownerSeqCounters[currentOwner] || 0);
+    for (const item of prepared) {
+        if (isPeerTombstoned(currentOwner, item.peerId, item.timestamp)) {
+            tombstoned.push(String(item.id));
+            continue;
+        }
+        if (candidate.some(existing => isDuplicateMessage(existing, item))) {
+            accepted.push(String(item.id));
+            continue;
+        }
+        item.seq = ++nextSeq;
+        candidate = [...candidate, item];
+        accepted.push(String(item.id));
+        inserted.push(item);
+    }
+
+    const trimmed = applyRetentionPolicy(candidate);
+    if (inserted.length) {
+        const candidateCounters = Object.assign({}, ownerSeqCounters, { [currentOwner]: nextSeq });
+        if (!saveJson(OWNER_SEQUENCES_FILE, candidateCounters)) {
+            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to reserve message sequences' });
+        }
+        ownerSeqCounters = candidateCounters;
+    }
+    if (!saveJson(MESSAGES_FILE, trimmed)) {
+        if (inserted.length) {
+            saveJson(OWNER_SEQUENCES_FILE, previousCounters);
+            ownerSeqCounters = previousCounters;
+        }
+        return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write message batch' });
+    }
+    messages = trimmed;
+    inserted.forEach(recordIncomingToPendingTransaction);
+    res.json({ ok: true, accepted, tombstoned, count: rows.length });
 });
 
 // 4. Record Sent Message from PC (Two-Way Sync)

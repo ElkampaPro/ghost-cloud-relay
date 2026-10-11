@@ -45,6 +45,7 @@ const c = {
     if (n === 'path') return path;
     if (n === 'fs') return { existsSync: () => false, mkdirSync() {}, writeFileSync() {}, renameSync() {}, unlinkSync() {} };
     if (n === 'socket.io-client') return { io() { return new FakeSocket(); } };
+    if (n === './pm-metadata') return require('../pm-metadata');
     if (n === './storage-codec') return require('../storage-codec');
     if (n === './request-budget') return require('../request-budget');
     if (n === './cors-policy') return require('../cors-policy');

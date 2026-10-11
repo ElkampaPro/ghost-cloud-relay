@@ -1,3 +1,4 @@
+const {pmMetadata,nativePmBody}=require('./pm-metadata');
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -895,7 +896,7 @@ function parseIncomingMessage(data, targetOwner = null) {
         // Extract avatar
         const avMatch = msgHtml.match(/<img[^>]*src="([^"]+)"[^>]*class="[^"]*(?:avatar_private|private_avatar)[^"]*"/i) ||
             msgHtml.match(/class="[^"]*(?:avatar_private|private_avatar)[^"]*"[^>]*src="([^"]+)"/i) ||
-            msgHtml.match(/<img[^>]*src="([^"]+)"/i);
+            (!/\bpm_msg\b/.test(msgHtml) && msgHtml.match(/<img[^>]*src="([^"]+)"/i));
         if (avMatch && avMatch[1]) {
             avatarSrc = avMatch[1];
         }
@@ -905,8 +906,10 @@ function parseIncomingMessage(data, targetOwner = null) {
         let bubbleHtml = contentMatch && contentMatch[1] ? contentMatch[1].trim() : msgHtml;
         bubbleHtml = bubbleHtml.replace(/<span[^>]*class="[^"]*(?:username|user_name|target_name)[^"]*"[^>]*>[\s\S]*?<\/span>/gi, '').trim();
         bubbleHtml = bubbleHtml.replace(/<img[^>]*class="[^"]*(?:avatar_private|private_avatar)[^"]*"[^>]*>/gi, '').trim();
-        msgHtml = bubbleHtml;
+        msgHtml = /\bpm_msg\b/.test(String(data.html)) ? String(data.html) : bubbleHtml;
         msgText = (data.message || data.msg || data.content) ? String(data.message || data.msg || data.content).trim() : stripHtml(msgHtml);
+        const nativeBody=nativePmBody(msgHtml);
+        if(nativeBody!==null)msgText=stripHtml(nativeBody);
     } else if (data.message || data.msg || data.content) {
         msgText = String(data.message || data.msg || data.content);
         msgHtml = msgText;
@@ -938,7 +941,7 @@ function parseIncomingMessage(data, targetOwner = null) {
         html: msgHtml || msgText || '[رسالة خاصة]',
         time: timeNow,
         timestamp: Date.now(),
-        type: (data.own || data.is_own || data.hunter || (data.html && /hunter_private/i.test(String(data.html)))) ? 'sent' : 'received',
+        type: (data.own || data.is_own || data.hunter || (data.html && /(?:hunter_private|\bpm_own\b)/i.test(String(data.html)))) ? 'sent' : 'received',
         synced: false,
         owner: targetOwner || getOwnerId(null)
     };
@@ -1986,7 +1989,7 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v55-20261011',
+        build: 'relay-sync-v56-20261012',
         checks: {
             secretConfigured: secretReady,
             storageReady: Boolean(storageHealth.ok && !transactionPending)
@@ -2295,6 +2298,7 @@ app.post('/api/messages/batch', requireAuth, (req, res) => {
         }
         const sent = direction === 'sent';
         prepared.push({
+            ...pmMetadata(message),
             id: message.id || (`msg_${sent ? 'sent' : 'in'}_` + Date.now() + '_' + index + '_' + Math.random().toString(36).slice(2, 7)),
             peerId: safePeerId,
             name: row.name || ('مستخدم ' + safePeerId),
@@ -2365,6 +2369,7 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
     const resolvedOwner = currentOwner;
 
     const sentItem = {
+        ...pmMetadata(message),
         id: message.id || ('msg_sent_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
         peerId: safePeerId,
         name: name || ('مستخدم ' + safePeerId),
@@ -2413,6 +2418,7 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
     }
 
     const incomingItem = {
+        ...pmMetadata(message),
         id: message.id || ('msg_in_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5)),
         peerId: safePeerId,
         name: name || ('مستخدم ' + safePeerId),

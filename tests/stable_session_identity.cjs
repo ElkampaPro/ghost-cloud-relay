@@ -26,6 +26,7 @@ const c = {Buffer,
     if (n === 'path') return path;
     if (n === 'fs') return { existsSync: () => false, mkdirSync() {}, writeFileSync() {}, renameSync() {}, unlinkSync() {} };
     if (n === 'socket.io-client') return { io() { return { on() {}, onAny() {}, removeAllListeners() {}, disconnect() {} }; } };
+    if (n === './pm-metadata') return require('../pm-metadata');
     if (n === './storage-codec') return require('../storage-codec');
     if (n === './request-budget') return require('../request-budget');
     if (n === './cors-policy') return require('../cors-policy');
@@ -87,6 +88,10 @@ for (const after_seq of ['1junk','-1','9007199254740992','', ['1']]) {
 assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:'old-epoch'}, {},headers('second')).status,409);
 assert.equal(vm.runInContext('JSON.stringify({messages,deviceCursors})',server),beforePull,'Stale ACK must not advance new-epoch cursor');
 assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:b.epoch}, {},headers('second')).status,200);
+// Presentation metadata survives cloud round trip without copying read flags.
+call('POST','/api/messages/incoming',{peerId:'p',message:{id:'quoted',text:'fixture',replyTo:'123',replyName:'A',replyPreview:'B',replyOwn:true,kind:'text',canReact:false,lrid:999,read:true}},{},headers('second'));
+const quote=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second')).payload.messages.find(m=>m.id==='quoted');
+assert.equal(quote.replyTo,'123');assert.equal(quote.replyPreview,'B');assert.equal(quote.canReact,false);assert.equal(quote.lrid,undefined);assert.equal(quote.read,undefined);
 // A legacy owner has evidence for the same identity; renewal migrates its sequence horizon.
 vm.runInContext(`accountSessions={'phpsess_legacy':{utk:'legacy',utks:['legacy'],cookies:'PHPSESSID=old',revoked:false}};sessionData={utk:'legacy',cookies:'PHPSESSID=old'};messages=[{owner:'phpsess_legacy',peerId:'p',id:'legacy-id',type:'received',timestamp:1,seq:90}];ownerSeqCounters={'phpsess_legacy':90};`,server);
 assert.equal(session('legacy','old').status,200);

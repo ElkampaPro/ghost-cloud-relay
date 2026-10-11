@@ -78,6 +78,15 @@ const b=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second'))
 assert.equal(a.messages.length,2);assert.equal(b.messages.length,2);
 assert.ok(b.current_seq>=Math.max(...b.messages.map(m=>m.seq)),'Counter must cover all retained message sequences');
 assert.equal(a.current_seq,b.current_seq);
+const beforePull = vm.runInContext('JSON.stringify({messages,deviceCursors})',server);
+assert.equal(call('GET','/api/sync',{}, {all:'true',mark:'true'},headers('second')).status,200);
+assert.equal(vm.runInContext('JSON.stringify({messages,deviceCursors})',server),beforePull,'Legacy GET mark must never modify message or cursor state');
+for (const after_seq of ['1junk','-1','9007199254740992','', ['1']]) {
+    assert.equal(call('GET','/api/sync',{}, {after_seq},headers('second')).status,400,'Invalid cursor rejected');
+}
+assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:'old-epoch'}, {},headers('second')).status,409);
+assert.equal(vm.runInContext('JSON.stringify({messages,deviceCursors})',server),beforePull,'Stale ACK must not advance new-epoch cursor');
+assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:b.epoch}, {},headers('second')).status,200);
 // A legacy owner has evidence for the same identity; renewal migrates its sequence horizon.
 vm.runInContext(`accountSessions={'phpsess_legacy':{utk:'legacy',utks:['legacy'],cookies:'PHPSESSID=old',revoked:false}};sessionData={utk:'legacy',cookies:'PHPSESSID=old'};messages=[{owner:'phpsess_legacy',peerId:'p',id:'legacy-id',type:'received',timestamp:1,seq:90}];ownerSeqCounters={'phpsess_legacy':90};`,server);
 assert.equal(session('legacy','old').status,200);

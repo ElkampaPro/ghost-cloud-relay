@@ -2134,13 +2134,16 @@ app.get('/api/sync', requireAuth, (req, res) => {
             serverTime: Date.now()
         });
     }
-    const markAsSynced = req.query.mark === 'true'; // Legacy fallback
+    // Legacy mark query is tolerated, but GET must not mutate delivery or read state.
     const getAll = req.query.all !== 'false'; // Default to TRUE so all devices get full sync
     const since = parseInt(req.query.since || '0', 10);
     const deviceId = req.query.device_id ? String(req.query.device_id).slice(0, 128) : null;
     const hasAfterSeq = req.query.after_seq !== undefined || req.query.since_seq !== undefined;
     const rawAfterSeq = req.query.after_seq !== undefined ? req.query.after_seq : req.query.since_seq;
-    const afterSeq = hasAfterSeq ? parseInt(rawAfterSeq, 10) : null;
+    const afterSeq = hasAfterSeq ? Number(rawAfterSeq) : null;
+    if (hasAfterSeq && (typeof rawAfterSeq !== 'string' || !/^\d+$/.test(rawAfterSeq) || !Number.isSafeInteger(afterSeq))) {
+        return res.status(400).json({ ok: false, error: 'Invalid after_seq: expected a safe non-negative integer' });
+    }
     const clientEpoch = req.query.epoch ? String(req.query.epoch).trim() : null;
     const epochMismatch = Boolean(clientEpoch && clientEpoch !== String(SERVER_EPOCH).trim());
 
@@ -2179,18 +2182,6 @@ app.get('/api/sync', requireAuth, (req, res) => {
         resultMsgs = since > 0 ? ownerMessages.filter(m => m.timestamp > since) : [...ownerMessages];
     } else {
         resultMsgs = ownerMessages.filter(m => !m.synced && (since === 0 || m.timestamp > since));
-    }
-
-    if (markAsSynced && resultMsgs.length > 0) {
-        const candidate = messages.map(m => {
-            const shouldMark = resultMsgs.some(rm => isDuplicateMessage(m, rm));
-            return shouldMark ? { ...m, synced: true } : m;
-        });
-        const saved = saveJson(MESSAGES_FILE, candidate);
-        if (!saved) {
-            return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update sync status' });
-        }
-        messages = candidate;
     }
 
     // Note: GET /api/sync is strictly read-only and idempotent.
@@ -2233,6 +2224,10 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
     const cursorKey = `${currentOwner}:${safeDeviceId}`;
     const prevCursor = deviceCursors[cursorKey] || {};
     const epochMismatch = Boolean(epoch && String(epoch).trim() !== String(SERVER_EPOCH).trim());
+    if (epochMismatch) {
+        return res.status(409).json({ ok: false, error: 'Stale server epoch; pull a fresh snapshot before acknowledging',
+            epoch: SERVER_EPOCH, epoch_mismatch: true, current_seq: currentOwnerSeq });
+    }
 
     if (epochMismatch) {
         return res.status(409).json({

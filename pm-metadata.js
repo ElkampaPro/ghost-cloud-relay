@@ -11,6 +11,11 @@ function pmMetadata(message) {
         if(['text','image','video','voice','music','file','youtube'].includes(message.replyKind))out.replyKind=message.replyKind;
     }
     if(typeof message?.canReact==='boolean')out.canReact=message.canReact;
+    if(message?.reactionState&&Array.isArray(message.reactionState.list)) {
+        const list=message.reactionState.list.filter(x=>Array.isArray(x)&&/^[a-z0-9-]{1,64}$/i.test(String(x[0]))&&Number.isSafeInteger(Number(x[1]))&&Number(x[1])>0).slice(0,100).map(x=>[String(x[0]),Number(x[1])]);
+        out.reactionState={list,total:list.reduce((n,x)=>n+x[1],0),mine:typeof message.reactionState.mine==='string'&&/^[a-z0-9-]{1,64}$/i.test(message.reactionState.mine)?message.reactionState.mine:null};
+    }
+    if(message?.sourceDeleted===true)out.sourceDeleted=true;
     return out;
 }
 function nativePmBody(html) {

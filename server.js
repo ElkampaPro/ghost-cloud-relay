@@ -933,6 +933,7 @@ function parseIncomingMessage(data, targetOwner = null) {
     const timeNow = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
 
     return {
+        ...pmMetadata(data),
         id: messageId,
         peerId: peerId,
         name: senderName,
@@ -1146,12 +1147,32 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             }
         });
 
+        // Reactions are independent from read acknowledgements. Retain the
+        // captured body even if the host later removes its original message.
+        sock.on('private-react', data => {
+            try { persistPrivateReaction(accKey,data); }
+            catch(err){console.error('[Socket] Reaction persistence failed:',err.message);}
+        });
+
         return sock;
     } catch (e) {
         lastError = e.message;
         addLog(`[Socket:${accKey}] Exception initializing socket: ${e.message}`);
         return null;
     }
+}
+
+function persistPrivateReaction(owner,data) {
+    if(!data||(data.v!==undefined&&Number(data.v)!==2)||!/^\d{1,20}$/.test(String(data.id))||!/^\d{1,20}$/.test(String(data.peer))||!Array.isArray(data.list))return false;
+    const index=messages.findIndex(m=>String(m.owner)===String(owner)&&String(m.id)===String(data.id)&&String(m.peerId)===String(data.peer));
+    if(index<0)return false;
+    const previous=messages[index],mine=String(data.by)===String(owner)?data.key:previous.reactionState?.mine;
+    const metadata=pmMetadata({reactionState:{list:data.list,mine:mine||null}});
+    if(JSON.stringify(metadata.reactionState)===JSON.stringify(previous.reactionState))return true;
+    const updated={...previous,...metadata,seq:nextOwnerSeq(owner)};
+    const candidate=messages.slice();candidate[index]=updated;
+    if(!saveJson(MESSAGES_FILE,candidate))return false;
+    messages=candidate;recordIncomingToPendingTransaction(updated);return true;
 }
 
 function initChatSocket() {

@@ -16,6 +16,7 @@ function pmMetadata(message) {
         out.reactionState={list,total:list.reduce((n,x)=>n+x[1],0),mine:typeof message.reactionState.mine==='string'&&/^[a-z0-9-]{1,64}$/i.test(message.reactionState.mine)?message.reactionState.mine:null};
     }
     if(message?.sourceDeleted===true)out.sourceDeleted=true;
+    if(message?.sourceDeletedBySender===true)out.sourceDeletedBySender=true;
     return out;
 }
 function nativePmBody(html) {

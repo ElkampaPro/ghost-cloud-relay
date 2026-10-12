@@ -1149,6 +1149,10 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
 
         // Reactions are independent from read acknowledgements. Retain the
         // captured body even if the host later removes its original message.
+        sock.on('private-del', data => {
+            try { persistPrivateDeletion(accKey,data); }
+            catch(err){console.error('[Socket] Deletion metadata persistence failed:',err.message);}
+        });
         sock.on('private-react', data => {
             try { persistPrivateReaction(accKey,data); }
             catch(err){console.error('[Socket] Reaction persistence failed:',err.message);}
@@ -1160,6 +1164,19 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
         addLog(`[Socket:${accKey}] Exception initializing socket: ${e.message}`);
         return null;
     }
+}
+
+function persistPrivateDeletion(owner,data) {
+    if(!data||(data.v!==undefined&&Number(data.v)!==2)||data.scope!=='all'||
+        !/^\d{1,20}$/.test(String(data.id))||!/^\d{1,20}$/.test(String(data.peer)))return false;
+    const index=messages.findIndex(m=>String(m.owner)===String(owner)&&m.type==='received'&&
+        String(m.id)===String(data.id)&&String(m.peerId)===String(data.peer));
+    if(index<0)return false;
+    const previous=messages[index];if(previous.sourceDeletedBySender)return true;
+    const updated={...previous,sourceDeleted:true,sourceDeletedBySender:true,canReact:false,seq:nextOwnerSeq(owner)};
+    const candidate=messages.slice();candidate[index]=updated;
+    if(!saveJson(MESSAGES_FILE,candidate))return false;
+    messages=candidate;recordIncomingToPendingTransaction(updated);return true;
 }
 
 function persistPrivateReaction(owner,data) {
@@ -2010,7 +2027,7 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v57-archive-reactions-20261012',
+        build: 'relay-sync-v58-deleted-message-color-20261012',
         checks: {
             secretConfigured: secretReady,
             storageReady: Boolean(storageHealth.ok && !transactionPending)

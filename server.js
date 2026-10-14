@@ -78,46 +78,10 @@ function addLog(msg) {
     if (serverLogs.length > 250) serverLogs.shift();
 }
 
-// Helper to load/save JSON
-function loadJson(file, defVal) {
-    try {
-        if (fs.existsSync(file)) {
-            const data = fs.readFileSync(file, 'utf8');
-            return storageCodec.decode(path.basename(file), data);
-        }
-    } catch (e) {
-        console.error(`[Storage] CRITICAL: Failed to parse ${file}: ${e.message}. Preserving original file to avoid data loss.`);
-        try {
-            const backup = `${file}.corrupt.${Date.now()}`;
-            fs.copyFileSync(file, backup);
-            console.warn(`[Storage] Corrupt file backed up to ${backup}`);
-        } catch (bErr) {}
-        // A bad key or corrupt file must never boot an empty store which could
-        // subsequently overwrite the user's original data.
-        throw new Error('Stored data could not be authenticated or parsed; startup aborted');
-    }
-    return defVal;
-}
-
-function saveJson(file, data) {
-    let tmpFile = null;
-    try {
-        const dir = path.dirname(file);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        tmpFile = path.join(dir, `.tmp_${path.basename(file)}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`);
-        fs.writeFileSync(tmpFile, storageCodec.encode(path.basename(file), data), { encoding: 'utf8', mode: 0o600 });
-        fs.renameSync(tmpFile, file);
-        return true;
-    } catch (e) {
-        if (tmpFile) {
-            try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (uErr) {}
-        }
-        console.error(`[Storage] Failed to write ${file}:`, e.message);
-        return false;
-    }
-}
+// Persistent storage owns encoding, atomic replacement and commit timing.
+const { createAtomicJsonStore } = require("./atomic-json-store");
+const atomicStore = createAtomicJsonStore({ fs, path, codec: storageCodec });
+const loadJson = atomicStore.load, saveJson = atomicStore.save;
 
 // Message Retention Policy: per-account retention protects accounts from mutual eviction
 const DEFAULT_MAX_MESSAGES_PER_ACCOUNT = 5000;
@@ -2027,7 +1991,7 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v58-deleted-message-color-20261012',
+        build: 'relay-sync-v59-storage-boundary-20261015',
         checks: {
             secretConfigured: secretReady,
             storageReady: Boolean(storageHealth.ok && !transactionPending)
@@ -2139,6 +2103,7 @@ app.get('/api/status', (req, res) => {
         currentRetentionCount: messages.length,
         pollerActive: true,
         storageHealth: storageHealth,
+        storagePerformance: atomicStore.stats(),
         lastPollTime: lastPollStats.lastPollTime,
         lastPollStatus: lastPollStats.status,
         lastPollCycles: lastPollStats.totalCycles,
@@ -2267,16 +2232,7 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
     const epochMismatch = Boolean(epoch && String(epoch).trim() !== String(SERVER_EPOCH).trim());
     if (epochMismatch) {
         return res.status(409).json({ ok: false, error: 'Stale server epoch; pull a fresh snapshot before acknowledging',
-            epoch: SERVER_EPOCH, epoch_mismatch: true, current_seq: currentOwnerSeq });
-    }
-
-    if (epochMismatch) {
-        return res.status(409).json({
-            ok: false,
-            error: 'Epoch mismatch: client cursor is from an older epoch',
-            epoch: SERVER_EPOCH,
-            snapshot_required: true
-        });
+            epoch: SERVER_EPOCH, epoch_mismatch: true, snapshot_required: true, current_seq: currentOwnerSeq });
     }
 
     const prevAckSeq = String(prevCursor.epoch) === String(SERVER_EPOCH) ? (Number(prevCursor.ack_seq) || 0) : 0;

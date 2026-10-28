@@ -9,7 +9,42 @@ require('dotenv').config();
 const { createStorageCodec } = require('./storage-codec');
 const { createRequestBudget } = require('./request-budget');
 const { createCorsOriginChecker } = require('./cors-policy');
+const { createAtomicJsonStore, createStorageTransactions } = require('./atomic-json-store');
 const storageCodec = createStorageCodec(process.env.GHOST_STORAGE_KEY || '');
+const storageTransactions = createStorageTransactions();
+let runtimeStorage = null;
+const startupStorageTasks = [];
+async function saveJsonAsync(file, value) {
+    try {
+        if (fatalExitScheduled) throw Object.assign(Error('Storage is unavailable pending restart'), { code: 'COMMIT_UNCERTAIN' });
+        if (!runtimeStorage) runtimeStorage = createAtomicJsonStore(process.env.GHOST_STORAGE_KEY || '');
+        return await runtimeStorage.write(file, value);
+    } catch (error) {
+        console.error('[Storage] Atomic write failed:', error.message);
+        if (error.code === 'COMMIT_UNCERTAIN') {
+            scheduleFatalExit('Storage outcome uncertain; restart required', error);
+            throw error;
+        }
+        return false;
+    }
+}
+function storageRoute(handler) {
+    return (req, res, next) => storageTransactions.run(() => {
+        if (fatalExitScheduled) throw Error('Storage unavailable pending restart');
+        return handler(req, res, next);
+    }).catch(error => {
+        console.error('[Storage] Request failed:', error.message);
+        if (!res.headersSent) res.status(500).json({ ok: false, error: 'Storage operation failed' });
+    });
+}
+function storageEvent(handler) {
+    return (...args) => storageTransactions.run(() => {
+        if (fatalExitScheduled) throw Error('Storage unavailable pending restart');
+        return handler(...args);
+    }).catch(error => {
+        console.error('[Storage] Background operation failed:', error.message);
+    });
+}
 
 // A process that reached an uncaught failure may hold partially-mutated state.
 // Fail fast so the platform can restart a clean instance instead of serving
@@ -78,10 +113,18 @@ function addLog(msg) {
     if (serverLogs.length > 250) serverLogs.shift();
 }
 
-// Persistent storage owns encoding, atomic replacement and commit timing.
-const { createAtomicJsonStore } = require("./atomic-json-store");
-const atomicStore = createAtomicJsonStore({ fs, path, codec: storageCodec });
-const loadJson = atomicStore.load, saveJson = atomicStore.save;
+// v59 startup storage boundary: runtime writes use the worker-backed store.
+const { createAtomicJsonStore: createStartupJsonStore } = require('./atomic-json-startup');
+const startupStore = createStartupJsonStore({ fs, path, codec: storageCodec });
+const loadJson = startupStore.load, saveJson = startupStore.save;
+function storageStatsSnapshot() {
+    const base = startupStore.stats();
+    const live = runtimeStorage && typeof runtimeStorage.stats === 'function' ? runtimeStorage.stats() : null;
+    if (!live) return base;
+    return { writes: base.writes + live.writes, failures: base.failures + live.failures,
+        lastWriteMs: live.writes + live.failures ? live.lastWriteMs : base.lastWriteMs,
+        maxWriteMs: Math.max(base.maxWriteMs, live.maxWriteMs) };
+}
 
 // Message Retention Policy: per-account retention protects accounts from mutual eviction
 const DEFAULT_MAX_MESSAGES_PER_ACCOUNT = 5000;
@@ -205,11 +248,11 @@ if (Array.isArray(messages)) {
     }
 }
 
-function nextOwnerSeq(owner) {
+async function nextOwnerSeq(owner) {
     const key = owner || 'default';
     const next = (ownerSeqCounters[key] || 0) + 1;
     const candidate = Object.assign({}, ownerSeqCounters, { [key]: next });
-    if (!saveJson(OWNER_SEQUENCES_FILE, candidate)) {
+    if (!await saveJsonAsync(OWNER_SEQUENCES_FILE, candidate)) {
         throw new Error('Sequence persistence failed');
     }
     ownerSeqCounters = candidate;
@@ -226,7 +269,7 @@ function isPeerTombstoned(owner, peerId, timestamp) {
     return false;
 }
 
-function recordIncomingToPendingTransaction(item) {
+async function recordIncomingToPendingTransaction(item) {
     if (!item || !item.id) return;
     try {
         if (fs.existsSync(TRANSACTION_FILE)) {
@@ -234,11 +277,16 @@ function recordIncomingToPendingTransaction(item) {
             if (tx && tx.status && tx.status !== 'committed' && tx.previous && Array.isArray(tx.previous.messages)) {
                 if (!tx.previous.messages.some(m => m.id === item.id)) {
                     tx.previous.messages.push(item);
-                    saveJson(TRANSACTION_FILE, tx);
+                    if (!await saveJsonAsync(TRANSACTION_FILE, tx)) {
+                        throw Error('Unable to preserve message in pending transaction journal');
+                    }
                 }
             }
         }
-    } catch (_) {}
+    } catch (error) {
+        scheduleFatalExit('Pending transaction journal update failed', error);
+        throw error;
+    }
 }
 
 function getCompositeMessageKey(m) {
@@ -363,7 +411,7 @@ function storedSessionIdentity(entry) {
         (/^\d+$/.test(String(entry.accountKey || '')) ? String(entry.accountKey) : null);
 }
 
-function reconcileOwnerSequenceHorizons() {
+async function reconcileOwnerSequenceHorizons() {
     const candidate = Object.assign({}, ownerSeqCounters);
     for (const [key, acc] of Object.entries(accountSessions)) {
         for (const legacy of (acc.legacyKeys || [])) {
@@ -376,7 +424,7 @@ function reconcileOwnerSequenceHorizons() {
         }
     }
     if (JSON.stringify(candidate) === JSON.stringify(ownerSeqCounters)) return true;
-    if (!saveJson(OWNER_SEQUENCES_FILE, candidate)) return false;
+    if (!await saveJsonAsync(OWNER_SEQUENCES_FILE, candidate)) return false;
     ownerSeqCounters = candidate;
     return true;
 }
@@ -561,16 +609,32 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
 }
 
 
-if (!reconcileOwnerSequenceHorizons()) {
-    storageHealth = { ok: false, error: 'Owner sequence reconciliation persistence failure', lastIncident: new Date().toISOString() };
-}
+startupStorageTasks.push(reconcileOwnerSequenceHorizons().then(saved => {
+    if (!saved) storageHealth = { ok: false, error: 'Owner sequence reconciliation persistence failure', lastIncident: new Date().toISOString() };
+}));
 
+async function commitAccountIdentity(key, value) {
+    const candidate = Object.assign({}, accountSessions, { [key]: value });
+    if (!await saveJsonAsync(ACCOUNTS_FILE, candidate)) throw Error('Account identity persistence failed');
+    accountSessions = candidate;
+}
+async function enrollAccountToken(key, token, includeHistoric = false) {
+    const account = accountSessions[key];
+    const tokens = Array.isArray(account.utks) ? account.utks : [account.utk].filter(Boolean);
+    if (tokens.includes(token)) return;
+    const candidate = Object.assign({}, account, { utks: [...tokens, token] });
+    if (includeHistoric) {
+        const historic = Array.isArray(account.historicUtks) ? account.historicUtks : [];
+        candidate.historicUtks = historic.includes(token) ? historic.slice() : [...historic, token];
+    }
+    await commitAccountIdentity(key, candidate);
+}
 // 3. Startup reconciliation: Ensure bidirectional sync between sessionData and accountSessions
-function ensureSessionDataInAccounts() {
+async function ensureSessionDataInAccounts() {
     if (sessionData && (sessionData.utk || sessionData.cookies)) {
         const stableId = extractStableAccountId(sessionData.cookies, sessionData.utk, storedSessionIdentity(sessionData)) || 'default_owner';
         if (!accountSessions[stableId]) {
-            accountSessions[stableId] = {
+            const candidate = {
                 accountKey: stableId,
                 userId: storedSessionIdentity(sessionData),
                 cookies: sessionData.cookies || '',
@@ -580,11 +644,10 @@ function ensureSessionDataInAccounts() {
                 historicUtks: [sessionData.utk].filter(Boolean),
                 lastUpdated: sessionData.lastUpdated || new Date().toISOString()
             };
-            saveJson(ACCOUNTS_FILE, accountSessions);
+            await commitAccountIdentity(stableId, candidate);
         } else {
             if (sessionData.utk && Array.isArray(accountSessions[stableId].utks) && !accountSessions[stableId].utks.includes(sessionData.utk)) {
-                accountSessions[stableId].utks.push(sessionData.utk);
-                saveJson(ACCOUNTS_FILE, accountSessions);
+                await enrollAccountToken(stableId, sessionData.utk);
             }
         }
     }
@@ -613,7 +676,7 @@ if (accountSessions && typeof accountSessions === 'object' && Object.keys(accoun
         if (!sessionData.userAgent && activeAccounts[0].userAgent) sessionData.userAgent = activeAccounts[0].userAgent;
     }
 } else {
-    ensureSessionDataInAccounts();
+    startupStorageTasks.push(ensureSessionDataInAccounts());
 }
 
 function generateRecoveryKey() {
@@ -640,8 +703,8 @@ function hasRegisteredAccounts() {
     return false;
 }
 
-function getOwnerId(req) {
-    ensureSessionDataInAccounts();
+async function getOwnerId(req) {
+    (await ensureSessionDataInAccounts());
     const activeEntries = Object.entries(accountSessions).filter(([k, acc]) => acc && !acc.revoked);
     const activeKeys = activeEntries.map(([k]) => k);
 
@@ -702,11 +765,7 @@ function getOwnerId(req) {
                 if (explicitAccountKey && accountSessions[explicitAccountKey]) {
                     const targetAcc = accountSessions[explicitAccountKey];
                     if (targetAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
-                        if (!targetAcc.utks) targetAcc.utks = [targetAcc.utk].filter(Boolean);
-                        if (!targetAcc.utks.includes(cleanToken)) {
-                            targetAcc.utks.push(cleanToken);
-                            saveJson(ACCOUNTS_FILE, accountSessions);
-                        }
+                        await enrollAccountToken(explicitAccountKey, cleanToken);
                     }
                     return explicitAccountKey;
                 }
@@ -716,11 +775,7 @@ function getOwnerId(req) {
                         const accUid = acc.userId || extractExplicitUserId(acc.cookies);
                         if (accUid && String(accUid) === cleanUid) {
                             if (cleanToken && !cleanToken.startsWith('unauthorized_')) {
-                                if (!acc.utks) acc.utks = [acc.utk].filter(Boolean);
-                                if (!acc.utks.includes(cleanToken)) {
-                                    acc.utks.push(cleanToken);
-                                    saveJson(ACCOUNTS_FILE, accountSessions);
-                                }
+                                await enrollAccountToken(key, cleanToken);
                             }
                             return key;
                         }
@@ -733,13 +788,7 @@ function getOwnerId(req) {
                 const singleKey = activeKeys[0];
                 const singleAcc = accountSessions[singleKey];
                 if (singleAcc && cleanToken && !cleanToken.startsWith('unauthorized_')) {
-                    if (!singleAcc.utks) singleAcc.utks = [singleAcc.utk].filter(Boolean);
-                    if (!singleAcc.utks.includes(cleanToken)) {
-                        singleAcc.utks.push(cleanToken);
-                        if (!singleAcc.historicUtks) singleAcc.historicUtks = [];
-                        if (!singleAcc.historicUtks.includes(cleanToken)) singleAcc.historicUtks.push(cleanToken);
-                        saveJson(ACCOUNTS_FILE, accountSessions);
-                    }
+                    await enrollAccountToken(singleKey, cleanToken, true);
                 }
                 return singleKey;
             }
@@ -829,7 +878,7 @@ function stripHtml(html) {
     return html.replace(/<[^>]*>?/gm, '').trim();
 }
 
-function parseIncomingMessage(data, targetOwner = null) {
+async function parseIncomingMessage(data, targetOwner = null) {
     if (!data) return null;
     let peerId = String(data.peer || data.target || data.from || data.sender || data.user_id || data.f_user || data.userId || '');
     if (!peerId || peerId === '0') {
@@ -908,7 +957,7 @@ function parseIncomingMessage(data, targetOwner = null) {
         timestamp: Date.now(),
         type: (data.own || data.is_own || data.hunter || (data.html && /(?:hunter_private|\bpm_own\b)/i.test(String(data.html)))) ? 'sent' : 'received',
         synced: false,
-        owner: targetOwner || getOwnerId(null)
+        owner: targetOwner || (await getOwnerId(null))
     };
 }
 
@@ -1010,6 +1059,8 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             lastMessageTime: null
         };
         accountSockets.set(accKey, entry);
+        const ownsCurrentSocket = () => accountSockets.get(accKey) === entry &&
+            accountSessions[accKey] && !accountSessions[accKey].revoked;
         chatSocket = sock; // Maintain backward compatibility for single-socket callers and tests
         if (sock.connected) {
             socketConnected = true;
@@ -1079,11 +1130,12 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             }
         });
 
-        sock.on('private-msg', (data) => {
+        sock.on('private-msg', storageEvent(async (data) => {
             try {
+                if (!ownsCurrentSocket()) return;
                 entry.lastMessageTime = new Date().toISOString();
                 addLog(`[Socket:${accKey}] Incoming private-msg received!`);
-                const parsed = parseIncomingMessage(data, accKey);
+                const parsed = (await parseIncomingMessage(data, accKey));
                 if (!parsed) return;
 
                 if (isPeerTombstoned(accKey, parsed.peerId, parsed.timestamp)) {
@@ -1094,13 +1146,13 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
                 // Check for duplicate using composite logic
                 const exists = messages.some(m => isDuplicateMessage(m, parsed));
                 if (!exists) {
-                    parsed.seq = nextOwnerSeq(accKey);
+                    parsed.seq = await nextOwnerSeq(accKey);
                     const candidate = [...messages, parsed];
                     const trimmed = applyRetentionPolicy(candidate);
-                    const saved = saveJson(MESSAGES_FILE, trimmed);
+                    const saved = await saveJsonAsync(MESSAGES_FILE, trimmed);
                     if (saved) {
                         messages = trimmed;
-                        recordIncomingToPendingTransaction(parsed);
+                        await recordIncomingToPendingTransaction(parsed);
                         addLog(`[Ghost Cloud] Captured message for account ${accKey} (id: ${parsed.id}, seq: ${parsed.seq})`);
                     } else {
                         console.error('[Socket] Failed to persist captured message to disk');
@@ -1109,18 +1161,20 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
             } catch (err) {
                 console.error(`[Socket:${accKey}] Error processing private-msg:`, err);
             }
-        });
+        }));
 
         // Reactions are independent from read acknowledgements. Retain the
         // captured body even if the host later removes its original message.
-        sock.on('private-del', data => {
-            try { persistPrivateDeletion(accKey,data); }
+        sock.on('private-del', storageEvent(async data => {
+            if (!ownsCurrentSocket()) return;
+            try { await persistPrivateDeletion(accKey,data); }
             catch(err){console.error('[Socket] Deletion metadata persistence failed:',err.message);}
-        });
-        sock.on('private-react', data => {
-            try { persistPrivateReaction(accKey,data); }
+        }));
+        sock.on('private-react', storageEvent(async data => {
+            if (!ownsCurrentSocket()) return;
+            try { await persistPrivateReaction(accKey,data); }
             catch(err){console.error('[Socket] Reaction persistence failed:',err.message);}
-        });
+        }));
 
         return sock;
     } catch (e) {
@@ -1130,30 +1184,30 @@ function connectAccountSocket(accKey, cookies, utk, userAgent) {
     }
 }
 
-function persistPrivateDeletion(owner,data) {
+async function persistPrivateDeletion(owner,data) {
     if(!data||(data.v!==undefined&&Number(data.v)!==2)||data.scope!=='all'||
         !/^\d{1,20}$/.test(String(data.id))||!/^\d{1,20}$/.test(String(data.peer)))return false;
     const index=messages.findIndex(m=>String(m.owner)===String(owner)&&m.type==='received'&&
         String(m.id)===String(data.id)&&String(m.peerId)===String(data.peer));
     if(index<0)return false;
     const previous=messages[index];if(previous.sourceDeletedBySender)return true;
-    const updated={...previous,sourceDeleted:true,sourceDeletedBySender:true,canReact:false,seq:nextOwnerSeq(owner)};
+    const updated={...previous,sourceDeleted:true,sourceDeletedBySender:true,canReact:false,seq:await nextOwnerSeq(owner)};
     const candidate=messages.slice();candidate[index]=updated;
-    if(!saveJson(MESSAGES_FILE,candidate))return false;
-    messages=candidate;recordIncomingToPendingTransaction(updated);return true;
+    if(!await saveJsonAsync(MESSAGES_FILE,candidate))return false;
+    messages=candidate;await recordIncomingToPendingTransaction(updated);return true;
 }
 
-function persistPrivateReaction(owner,data) {
+async function persistPrivateReaction(owner,data) {
     if(!data||(data.v!==undefined&&Number(data.v)!==2)||!/^\d{1,20}$/.test(String(data.id))||!/^\d{1,20}$/.test(String(data.peer))||!Array.isArray(data.list))return false;
     const index=messages.findIndex(m=>String(m.owner)===String(owner)&&String(m.id)===String(data.id)&&String(m.peerId)===String(data.peer));
     if(index<0)return false;
     const previous=messages[index],mine=String(data.by)===String(owner)?data.key:previous.reactionState?.mine;
     const metadata=pmMetadata({reactionState:{list:data.list,mine:mine||null}});
     if(JSON.stringify(metadata.reactionState)===JSON.stringify(previous.reactionState))return true;
-    const updated={...previous,...metadata,seq:nextOwnerSeq(owner)};
+    const updated={...previous,...metadata,seq:await nextOwnerSeq(owner)};
     const candidate=messages.slice();candidate[index]=updated;
-    if(!saveJson(MESSAGES_FILE,candidate))return false;
-    messages=candidate;recordIncomingToPendingTransaction(updated);return true;
+    if(!await saveJsonAsync(MESSAGES_FILE,candidate))return false;
+    messages=candidate;await recordIncomingToPendingTransaction(updated);return true;
 }
 
 function initChatSocket() {
@@ -1290,7 +1344,12 @@ async function pollSingleAccount(target) {
             peersToCheck.set(peerId, { peerId, name, avatar, unreadCount });
         }
 
-        // 2. Parse contacts from notifyHtml (Read-only, Zero-Seen compliant)
+        // Apply metadata only between committed transactions. The HTTP request
+        // above stays outside the queue so a slow host cannot block ingestion.
+        await storageTransactions.run(() => {
+        const current = accountSessions[target.key];
+        const credentials = current || (target.key === 'default' ? sessionData : null);
+        if (!credentials || credentials.revoked || credentials.utk !== target.utk || credentials.cookies !== target.cookies) return;
         for (const [peerId, info] of peersToCheck.entries()) {
             messages.forEach(m => {
                 if (m.peerId === peerId && (!m.owner || m.owner === target.key)) {
@@ -1312,6 +1371,7 @@ async function pollSingleAccount(target) {
                 }
             }
         }
+        });
         return true;
     } catch (err) {
         lastPollStats.lastError = err.message;
@@ -1321,6 +1381,8 @@ async function pollSingleAccount(target) {
 }
 
 async function pollArabicChatOnce() {
+    if (gracefulShutdownStarted) return;
+    const targets = await storageTransactions.run(() => {
     const targets = [];
     for (const [k, acc] of Object.entries(accountSessions)) {
         if (acc && !acc.revoked && (acc.cookies || acc.utk)) {
@@ -1330,6 +1392,8 @@ async function pollArabicChatOnce() {
     if (targets.length === 0 && sessionData && (sessionData.utk || sessionData.cookies)) {
         targets.push({ key: 'default', cookies: sessionData.cookies, utk: sessionData.utk, userAgent: sessionData.userAgent });
     }
+    return targets;
+    });
 
     if (targets.length === 0) {
         lastPollStats.status = 'no_credentials';
@@ -1367,7 +1431,7 @@ function startPollingEngine() {
     pollIntervalTimer = setInterval(pollArabicChatOnce, 2500);
 
     // 3-second Active Socket Watchdog (Rapid Per-Account Recovery)
-    pollWatchdogTimer = setInterval(() => {
+    pollWatchdogTimer = setInterval(storageEvent(() => {
         const hasSessionCreds = Boolean(sessionData && (sessionData.cookies || sessionData.utk));
         const hasActiveAccounts = Object.values(accountSessions).some(a => !a.revoked && a.cookies && a.utk);
         if (!hasSessionCreds && !hasActiveAccounts) {
@@ -1403,7 +1467,7 @@ function startPollingEngine() {
                 connectAccountSocket(stableId, sessionData.cookies, sessionData.utk, sessionData.userAgent);
             }
         }
-    }, 3000);
+    }), 3000);
 }
 
 // CORS configuration for the chat website, packaged extension, and native clients.
@@ -1991,16 +2055,16 @@ app.get('/api/health', (req, res) => {
         status: ready ? 'healthy' : 'degraded',
         uptime: Math.round(process.uptime()),
         service: 'ghost-cloud-relay',
-        build: 'relay-sync-v59-storage-boundary-20261015',
+        build: 'relay-async-storage-v59-safe-20261028',
         checks: {
             secretConfigured: secretReady,
-            storageReady: Boolean(storageHealth.ok && !transactionPending)
+            storageReady: Boolean(storageHealth.ok && !transactionPending && !fatalExitScheduled)
         }
     });
 });
 
 // 2. Status API
-app.get('/api/status', (req, res) => {
+app.get('/api/status', storageRoute(async (req, res) => {
     const isAuthed = checkAuth(req);
     const isAnySocketConnected = accountSockets.size > 0 ? Array.from(accountSockets.values()).some(e => e.connected) : socketConnected;
 
@@ -2014,7 +2078,7 @@ app.get('/api/status', (req, res) => {
     }
 
     const activeKeys = Object.keys(accountSessions).filter(k => accountSessions[k] && !accountSessions[k].revoked);
-    const reqOwner = getOwnerId(req);
+    const reqOwner = (await getOwnerId(req));
     let accountConnected = undefined;
     let accountLastError = undefined;
     let accountLastConnectedTime = undefined;
@@ -2103,7 +2167,7 @@ app.get('/api/status', (req, res) => {
         currentRetentionCount: messages.length,
         pollerActive: true,
         storageHealth: storageHealth,
-        storagePerformance: atomicStore.stats(),
+        storagePerformance: storageStatsSnapshot(),
         lastPollTime: lastPollStats.lastPollTime,
         lastPollStatus: lastPollStats.status,
         lastPollCycles: lastPollStats.totalCycles,
@@ -2117,20 +2181,20 @@ app.get('/api/status', (req, res) => {
         current_seq: currentSeq,
         epoch: SERVER_EPOCH
     });
-});
+}));
 
 // 2.1 Live Logs API (For inspection & forensics)
-app.get('/api/logs', requireAuth, (req, res) => {
+app.get('/api/logs', requireAuth, storageRoute(async (req, res) => {
     res.json({
         ok: true,
         count: serverLogs.length,
         logs: serverLogs
     });
-});
+}));
 
 // 3. Sync Messages (Multi-Device Safe: PC, Mobile, PWA with Monotonic seq_id & Device Cursors)
-app.get('/api/sync', requireAuth, (req, res) => {
-    const currentOwner = getOwnerId(req);
+app.get('/api/sync', requireAuth, storageRoute(async (req, res) => {
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({
             ok: false,
@@ -2202,11 +2266,11 @@ app.get('/api/sync', requireAuth, (req, res) => {
         snapshot_required: snapshotRequired,
         serverTime: Date.now()
     });
-});
+}));
 
 // 3.1 Per-Device Cursor Acknowledgement API (Zero-Seen Safe)
-app.post('/api/sync/ack', requireAuth, (req, res) => {
-    const currentOwner = getOwnerId(req);
+app.post('/api/sync/ack', requireAuth, storageRoute(async (req, res) => {
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: valid account token is required' });
     }
@@ -2250,7 +2314,7 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         epoch: SERVER_EPOCH
     };
     const candidateCursors = Object.assign({}, deviceCursors, { [cursorKey]: nextCursor });
-    const saved = saveJson(DEVICE_CURSORS_FILE, candidateCursors);
+    const saved = await saveJsonAsync(DEVICE_CURSORS_FILE, candidateCursors);
     if (!saved) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update device cursor' });
     }
@@ -2264,16 +2328,16 @@ app.post('/api/sync/ack', requireAuth, (req, res) => {
         epoch_mismatch: epochMismatch,
         current_seq: ownerSeqCounters[currentOwner] || 0
     });
-});
+}));
 
 // 4. Record a bounded group of queued messages with one durable write.
 // Deletions stay on their transactional endpoint and are never mixed into a batch.
-app.post('/api/messages/batch', requireAuth, (req, res) => {
+app.post('/api/messages/batch', requireAuth, storageRoute(async (req, res) => {
     const rows = req.body && req.body.items;
     if (!Array.isArray(rows) || rows.length < 1 || rows.length > 50) {
         return res.status(400).json({ ok: false, error: 'items must contain between 1 and 50 messages' });
     }
-    const currentOwner = getOwnerId(req);
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
     }
@@ -2331,32 +2395,32 @@ app.post('/api/messages/batch', requireAuth, (req, res) => {
     const trimmed = applyRetentionPolicy(candidate);
     if (inserted.length) {
         const candidateCounters = Object.assign({}, ownerSeqCounters, { [currentOwner]: nextSeq });
-        if (!saveJson(OWNER_SEQUENCES_FILE, candidateCounters)) {
+        if (!await saveJsonAsync(OWNER_SEQUENCES_FILE, candidateCounters)) {
             return res.status(500).json({ ok: false, error: 'Persistence failure: unable to reserve message sequences' });
         }
         ownerSeqCounters = candidateCounters;
     }
-    if (!saveJson(MESSAGES_FILE, trimmed)) {
+    if (!await saveJsonAsync(MESSAGES_FILE, trimmed)) {
         if (inserted.length) {
-            saveJson(OWNER_SEQUENCES_FILE, previousCounters);
+            await saveJsonAsync(OWNER_SEQUENCES_FILE, previousCounters);
             ownerSeqCounters = previousCounters;
         }
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write message batch' });
     }
     messages = trimmed;
-    inserted.forEach(recordIncomingToPendingTransaction);
+    for (const item of inserted) await recordIncomingToPendingTransaction(item);
     res.json({ ok: true, accepted, tombstoned, count: rows.length });
-});
+}));
 
 // 4. Record Sent Message from PC (Two-Way Sync)
-app.post('/api/messages/sent', requireAuth, (req, res) => {
+app.post('/api/messages/sent', requireAuth, storageRoute(async (req, res) => {
     const { peerId, name, message } = req.body;
     if (!peerId || !message) {
         return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
     }
 
     const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
-    const currentOwner = getOwnerId(req);
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
     }
@@ -2383,30 +2447,30 @@ app.post('/api/messages/sent', requireAuth, (req, res) => {
 
     const exists = messages.some(m => isDuplicateMessage(m, sentItem));
     if (!exists) {
-        sentItem.seq = nextOwnerSeq(resolvedOwner);
+        sentItem.seq = await nextOwnerSeq(resolvedOwner);
         const candidate = [...messages, sentItem];
         const trimmed = applyRetentionPolicy(candidate);
-        const saved = saveJson(MESSAGES_FILE, trimmed);
+        const saved = await saveJsonAsync(MESSAGES_FILE, trimmed);
         if (!saved) {
             return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
         }
         messages = trimmed;
-        recordIncomingToPendingTransaction(sentItem);
+        await recordIncomingToPendingTransaction(sentItem);
         console.log(`[Ghost Cloud] Two-Way Sync: Recorded sent message (id: ${sentItem.id}, seq: ${sentItem.seq})`);
     }
 
     res.json({ ok: true, data: sentItem });
-});
+}));
 
 // 4.1 Record Incoming Message from Extension (Two-Way Sync)
-app.post('/api/messages/incoming', requireAuth, (req, res) => {
+app.post('/api/messages/incoming', requireAuth, storageRoute(async (req, res) => {
     const { peerId, name, message } = req.body;
     if (!peerId || !message) {
         return res.status(400).json({ ok: false, error: 'Missing peerId or message' });
     }
 
     const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
-    const currentOwner = getOwnerId(req);
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
     }
@@ -2432,23 +2496,23 @@ app.post('/api/messages/incoming', requireAuth, (req, res) => {
 
     const exists = messages.some(m => isDuplicateMessage(m, incomingItem));
     if (!exists) {
-        incomingItem.seq = nextOwnerSeq(currentOwner);
+        incomingItem.seq = await nextOwnerSeq(currentOwner);
         const candidate = [...messages, incomingItem];
         const trimmed = applyRetentionPolicy(candidate);
-        const saved = saveJson(MESSAGES_FILE, trimmed);
+        const saved = await saveJsonAsync(MESSAGES_FILE, trimmed);
         if (!saved) {
             return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
         }
         messages = trimmed;
-        recordIncomingToPendingTransaction(incomingItem);
+        await recordIncomingToPendingTransaction(incomingItem);
         console.log(`[Ghost Cloud] Two-Way Sync: Recorded incoming message (id: ${incomingItem.id}, seq: ${incomingItem.seq})`);
     }
 
     res.json({ ok: true, data: incomingItem });
-});
+}));
 
 // 4.1 Delete Peer Messages API (For Tombstone / Contact Deletion Sync)
-app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
+app.post('/api/messages/delete-peer', requireAuth, storageRoute(async (req, res) => {
     const { peerId, beforeTimestamp } = req.body;
     if (!peerId) {
         return res.status(400).json({ ok: false, error: 'Missing peerId parameter' });
@@ -2458,7 +2522,7 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
         return res.status(400).json({ ok: false, error: 'Missing or invalid beforeTimestamp cutoff parameter' });
     }
     const safePeerId = String(peerId).replace(/["'<>]/g, '').slice(0, 64);
-    const currentOwner = getOwnerId(req);
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.status(401).json({ ok: false, error: 'Unauthorized: account token is required or invalid' });
     }
@@ -2500,13 +2564,13 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
             messages: snapshotMessages
         }
     };
-    const savedTx = saveJson(TRANSACTION_FILE, txRecord);
+    const savedTx = await saveJsonAsync(TRANSACTION_FILE, txRecord);
     if (!savedTx) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to create deletion transaction journal' });
     }
 
     if (cutoffsChanged) {
-        const cutoffsSaved = saveJson(DELETION_CUTOFFS_FILE, updatedCutoffs);
+        const cutoffsSaved = await saveJsonAsync(DELETION_CUTOFFS_FILE, updatedCutoffs);
         if (!cutoffsSaved) {
             try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
             return res.status(500).json({ ok: false, error: 'Persistence failure while saving deletion cutoff tombstone' });
@@ -2520,10 +2584,10 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
         if (!isTarget) return true;
         return (Number(m.timestamp) || 0) > cutoff;
     });
-    const saved = saveJson(MESSAGES_FILE, filtered);
+    const saved = await saveJsonAsync(MESSAGES_FILE, filtered);
     if (!saved) {
         if (cutoffsChanged) {
-            saveJson(DELETION_CUTOFFS_FILE, snapshotCutoffs);
+            await saveJsonAsync(DELETION_CUTOFFS_FILE, snapshotCutoffs);
             deletionCutoffs = snapshotCutoffs;
         }
         try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
@@ -2543,7 +2607,7 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
     if (!committed) {
         try {
             txRecord.status = 'committed';
-            if (saveJson(TRANSACTION_FILE, txRecord)) {
+            if (await saveJsonAsync(TRANSACTION_FILE, txRecord)) {
                 committed = true;
             }
         } catch (_) {}
@@ -2552,10 +2616,10 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
     if (!committed) {
         // Rollback memory and disk state to prevent false success on uncommitted journal
         if (cutoffsChanged) {
-            saveJson(DELETION_CUTOFFS_FILE, snapshotCutoffs);
+            await saveJsonAsync(DELETION_CUTOFFS_FILE, snapshotCutoffs);
             deletionCutoffs = snapshotCutoffs;
         }
-        saveJson(MESSAGES_FILE, snapshotMessages);
+        await saveJsonAsync(MESSAGES_FILE, snapshotMessages);
         messages = snapshotMessages;
         storageHealth = {
             ok: false,
@@ -2572,11 +2636,11 @@ app.post('/api/messages/delete-peer', requireAuth, (req, res) => {
 
     console.log(`[Ghost Cloud] Deleted ${beforeCount - messages.length} messages for peer ${safePeerId} (cutoff: ${cutoff})`);
     res.json({ ok: true, deleted: beforeCount - messages.length, cutoff });
-});
+}));
 
 // 5. Get Full Conversations (For Mobile Web Viewer)
-app.get('/api/conversations', requireAuth, (req, res) => {
-    const currentOwner = getOwnerId(req);
+app.get('/api/conversations', requireAuth, storageRoute(async (req, res) => {
+    const currentOwner = (await getOwnerId(req));
     if (!currentOwner || currentOwner.startsWith('unauthorized_')) {
         return res.json({ ok: true, count: 0, conversations: [] });
     }
@@ -2619,9 +2683,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
         return c;
     }).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
     res.json({ ok: true, count: convs.length, conversations: convs });
-});
+}));
 
-function performRevocation(req, res) {
+async function performRevocation(req, res) {
     const clientToken = (req.headers && req.headers['x-ghost-token']) ||
                         (req.body && (req.body.existingToken || req.body.sessionToken || req.body.token)) ||
                         (req.query && (req.query.sessionToken || req.query.token));
@@ -2702,7 +2766,7 @@ function performRevocation(req, res) {
         if (targetKey) {
             disconnectAccountSocket(targetKey);
         }
-        const savedAcc = saveJson(ACCOUNTS_FILE, accountSessions);
+        const savedAcc = await saveJsonAsync(ACCOUNTS_FILE, accountSessions);
         if (!savedAcc) {
             return res.status(500).json({ ok: false, error: 'Persistence failure: unable to update accounts file' });
         }
@@ -2734,7 +2798,7 @@ function performRevocation(req, res) {
         socketConnected = false;
     }
 
-    const savedSession = saveJson(SESSION_FILE, sessionData);
+    const savedSession = await saveJsonAsync(SESSION_FILE, sessionData);
     if (!savedSession) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write session file' });
     }
@@ -2750,15 +2814,15 @@ function performRevocation(req, res) {
 }
 
 // 5.1 Logout API (Explicit endpoint to revoke session & expire credentials)
-app.post('/api/logout', requireAuth, (req, res) => {
-    return performRevocation(req, res);
-});
-app.post('/api/session/logout', requireAuth, (req, res) => {
-    return performRevocation(req, res);
-});
+app.post('/api/logout', requireAuth, storageRoute(async (req, res) => {
+    return await performRevocation(req, res);
+}));
+app.post('/api/session/logout', requireAuth, storageRoute(async (req, res) => {
+    return await performRevocation(req, res);
+}));
 
 // 6. Update Session / Cookies (Called automatically by Extension on page visit)
-app.post('/api/session', requireAuth, (req, res) => {
+app.post('/api/session', requireAuth, storageRoute(async (req, res) => {
     // If storage is degraded from a previous failed transaction or startup recovery, attempt reconciliation before accepting mutations
     if (storageHealth && !storageHealth.ok) {
         if (fs.existsSync(TRANSACTION_FILE)) {
@@ -2766,18 +2830,18 @@ app.post('/api/session', requireAuth, (req, res) => {
                 const tx = loadJson(TRANSACTION_FILE, null);
                 if (tx && tx.status && tx.status !== 'committed' && tx.previous) {
                     let allRestored = true;
-                    if (tx.previous.deletionCutoffs && !saveJson(DELETION_CUTOFFS_FILE, tx.previous.deletionCutoffs)) allRestored = false;
-                    if (tx.previous.accounts && !saveJson(ACCOUNTS_FILE, tx.previous.accounts)) allRestored = false;
+                    if (tx.previous.deletionCutoffs && !await saveJsonAsync(DELETION_CUTOFFS_FILE, tx.previous.deletionCutoffs)) allRestored = false;
+                    if (tx.previous.accounts && !await saveJsonAsync(ACCOUNTS_FILE, tx.previous.accounts)) allRestored = false;
                     if (tx.previous.messages) {
                         const currentDiskMessages = loadJson(MESSAGES_FILE, messages || []);
                         const mergedMessages = reconcileRecoveredMessagesList(tx.previous.messages, currentDiskMessages);
-                        if (saveJson(MESSAGES_FILE, mergedMessages)) {
+                        if (await saveJsonAsync(MESSAGES_FILE, mergedMessages)) {
                             messages = mergedMessages;
                         } else {
                             allRestored = false;
                         }
                     }
-                    if (tx.previous.session && !saveJson(SESSION_FILE, tx.previous.session)) allRestored = false;
+                    if (tx.previous.session && !await saveJsonAsync(SESSION_FILE, tx.previous.session)) allRestored = false;
                     if (allRestored) {
                         try { fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
                         if (tx.previous.deletionCutoffs) deletionCutoffs = tx.previous.deletionCutoffs;
@@ -2827,7 +2891,7 @@ app.post('/api/session', requireAuth, (req, res) => {
         !(typeof cookies === 'string' && cookies.trim()) &&
         !(typeof utk === 'string' && utk.trim());
     if (explicitlyClearingSession) {
-        return performRevocation(req, res);
+        return await performRevocation(req, res);
     }
 
     const candidateUtk = utk !== undefined ? (typeof utk === 'string' ? utk.trim() : '') : (prevSession ? prevSession.utk : '');
@@ -3253,7 +3317,7 @@ app.post('/api/session', requireAuth, (req, res) => {
                     session: snapshotSessionData
                 }
             };
-            const savedTx = saveJson(TRANSACTION_FILE, txRecord);
+            const savedTx = await saveJsonAsync(TRANSACTION_FILE, txRecord);
             if (!savedTx) {
                 // Journal write failed! Abort before touching ANY state files on disk!
                 sessionData = snapshotSessionData;
@@ -3273,7 +3337,7 @@ app.post('/api/session', requireAuth, (req, res) => {
 
             // 2. Persist ACCOUNTS_FILE FIRST!
             // If writing accounts fails, session.json and messages.json on disk were never touched.
-            const savedAcc = saveJson(ACCOUNTS_FILE, accountSessions);
+            const savedAcc = await saveJsonAsync(ACCOUNTS_FILE, accountSessions);
             if (!savedAcc) {
                 try { if (fs.existsSync(TRANSACTION_FILE)) fs.unlinkSync(TRANSACTION_FILE); } catch (_) {}
                 sessionData = snapshotSessionData;
@@ -3284,10 +3348,10 @@ app.post('/api/session', requireAuth, (req, res) => {
 
             // 3. Persist MESSAGES_FILE SECOND if migrated
             if (migrated) {
-                const savedMessages = saveJson(MESSAGES_FILE, messages);
+                const savedMessages = await saveJsonAsync(MESSAGES_FILE, messages);
                 if (!savedMessages) {
                     // Rollback accounts file on disk
-                    const rolledBack = saveJson(ACCOUNTS_FILE, snapshotAccountSessions);
+                    const rolledBack = await saveJsonAsync(ACCOUNTS_FILE, snapshotAccountSessions);
                     sessionData = snapshotSessionData;
                     accountSessions = snapshotAccountSessions;
                     messages = snapshotMessages;
@@ -3298,7 +3362,7 @@ app.post('/api/session', requireAuth, (req, res) => {
                             lastIncident: new Date().toISOString()
                         };
                         txRecord.status = 'rollback_failed';
-                        const savedTxStatus = saveJson(TRANSACTION_FILE, txRecord);
+                        const savedTxStatus = await saveJsonAsync(TRANSACTION_FILE, txRecord);
                         if (!savedTxStatus) {
                             console.error('[Transaction] Failed to update transaction status to rollback_failed');
                         }
@@ -3311,14 +3375,14 @@ app.post('/api/session', requireAuth, (req, res) => {
         }
 
         // 4. Persist SESSION_FILE LAST!
-        const saved = saveJson(SESSION_FILE, sessionData);
+        const saved = await saveJsonAsync(SESSION_FILE, sessionData);
         if (!saved) {
             let rollbackFailed = false;
             if (accKey) {
                 // Rollback accounts file on disk
-                if (!saveJson(ACCOUNTS_FILE, snapshotAccountSessions)) rollbackFailed = true;
+                if (!await saveJsonAsync(ACCOUNTS_FILE, snapshotAccountSessions)) rollbackFailed = true;
                 if (migrated) {
-                    if (!saveJson(MESSAGES_FILE, snapshotMessages)) rollbackFailed = true;
+                    if (!await saveJsonAsync(MESSAGES_FILE, snapshotMessages)) rollbackFailed = true;
                 }
             }
             sessionData = snapshotSessionData;
@@ -3332,7 +3396,7 @@ app.post('/api/session', requireAuth, (req, res) => {
                 };
                 if (typeof txRecord !== 'undefined') {
                     txRecord.status = 'rollback_failed';
-                    const savedTxStatus = saveJson(TRANSACTION_FILE, txRecord);
+                    const savedTxStatus = await saveJsonAsync(TRANSACTION_FILE, txRecord);
                     if (!savedTxStatus) {
                         console.error('[Transaction] Failed to update transaction status to rollback_failed');
                     }
@@ -3357,7 +3421,7 @@ app.post('/api/session', requireAuth, (req, res) => {
             try {
                 if (typeof txRecord !== 'undefined') {
                     txRecord.status = 'committed';
-                    if (saveJson(TRANSACTION_FILE, txRecord)) {
+                    if (await saveJsonAsync(TRANSACTION_FILE, txRecord)) {
                         committed = true;
                     }
                 }
@@ -3368,10 +3432,10 @@ app.post('/api/session', requireAuth, (req, res) => {
             // Failed both to unlink journal and to mark committed!
             // Revert state on disk and in memory to prevent false success.
             if (accKey) {
-                saveJson(ACCOUNTS_FILE, snapshotAccountSessions);
-                if (migrated) saveJson(MESSAGES_FILE, snapshotMessages);
+                await saveJsonAsync(ACCOUNTS_FILE, snapshotAccountSessions);
+                if (migrated) await saveJsonAsync(MESSAGES_FILE, snapshotMessages);
             }
-            saveJson(SESSION_FILE, snapshotSessionData);
+            await saveJsonAsync(SESSION_FILE, snapshotSessionData);
             sessionData = snapshotSessionData;
             accountSessions = snapshotAccountSessions;
             messages = snapshotMessages;
@@ -3402,7 +3466,7 @@ app.post('/api/session', requireAuth, (req, res) => {
         }
     }
 
-    if (!reconcileOwnerSequenceHorizons()) {
+    if (!(await reconcileOwnerSequenceHorizons())) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to preserve account sequence horizon' });
     }
     const hasPhp = (sessionData.cookies || '').includes('PHPSESSID');
@@ -3424,12 +3488,12 @@ app.post('/api/session', requireAuth, (req, res) => {
         hasSessionCookies: hasAuthCookies,
         recoveryKey: (accKey && accountSessions[accKey]) ? accountSessions[accKey].recoveryKey : undefined
     });
-});
+}));
 
 // Clean dead/unauthorized/non-current accounts
-app.post('/api/accounts/clean', requireAuth, (req, res) => {
+app.post('/api/accounts/clean', requireAuth, storageRoute(async (req, res) => {
     let purgedCount = 0;
-    const currentOwner = getOwnerId(req);
+    const currentOwner = (await getOwnerId(req));
     let keepKey = req.body.keepKey || (currentOwner && !currentOwner.startsWith('unauthorized_') ? currentOwner : null);
     const keepUserId = req.body.userId || (req.headers && req.headers['x-ghost-user-id']);
 
@@ -3481,28 +3545,28 @@ app.post('/api/accounts/clean', requireAuth, (req, res) => {
         sessionData.utk = accountSessions[keepKey].utk || '';
         sessionData.userAgent = accountSessions[keepKey].userAgent || '';
         sessionData.lastUpdated = accountSessions[keepKey].lastUpdated || new Date().toISOString();
-        saveJson(SESSION_FILE, sessionData);
+        await saveJsonAsync(SESSION_FILE, sessionData);
 
         // E03 Fix: Enforce strict account isolation. Never reassign messages across distinct account owners!
         // Each account retains its own messages securely without cross-account contamination.
     }
 
-    saveJson(ACCOUNTS_FILE, accountSessions);
+    await saveJsonAsync(ACCOUNTS_FILE, accountSessions);
     addLog(`[Accounts] Cleaned up ${purgedCount} dead or inactive account(s) from cloud relay. Kept: [${keepKey}].`);
     res.json({ ok: true, purgedCount, keptAccount: keepKey, activeAccounts: Object.keys(accountSessions) });
-});
+}));
 
 // 7. Test Message Injector (For debugging and manual verification)
-app.post('/api/test-msg', requireAuth, (req, res) => {
+app.post('/api/test-msg', requireAuth, storageRoute(async (req, res) => {
     const { peer, name, message } = req.body;
     const testPeer = String(peer || '9999');
     const testName = name || 'تجربة سحابية 👻';
     const testText = message || 'هذه رسالة واردة تم التقاطها عبر السيرفر السحابي أثناء إغلاق المتصفح!';
 
-    const testOwner = getOwnerId(req);
+    const testOwner = (await getOwnerId(req));
     const testMsg = {
         id: 'msg_test_' + Date.now(),
-        seq: nextOwnerSeq(testOwner),
+        seq: await nextOwnerSeq(testOwner),
         peerId: testPeer,
         name: testName,
         avatar: 'default_images/avatar/default_avatar.png',
@@ -3516,7 +3580,7 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
     };
 
     const candidate = [...messages, testMsg];
-    const saved = saveJson(MESSAGES_FILE, candidate);
+    const saved = await saveJsonAsync(MESSAGES_FILE, candidate);
     if (!saved) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
     }
@@ -3527,21 +3591,24 @@ app.post('/api/test-msg', requireAuth, (req, res) => {
         message: 'Test message added to cloud storage',
         data: testMsg
     });
-});
+}));
 
 // 8. Clear Messages API
-app.post('/api/clear', requireAuth, (req, res) => {
-    const saved = saveJson(MESSAGES_FILE, []);
+app.post('/api/clear', requireAuth, storageRoute(async (req, res) => {
+    const saved = await saveJsonAsync(MESSAGES_FILE, []);
     if (!saved) {
         return res.status(500).json({ ok: false, error: 'Persistence failure: unable to write messages file' });
     }
     messages = [];
     res.json({ ok: true, message: 'All messages cleared' });
-});
+}));
 
 // Start Server
 let selfPingTimer = null;
-const httpServer = app.listen(PORT, '0.0.0.0', () => {
+let httpServer = null;
+Promise.all(startupStorageTasks).then(() => {
+if (gracefulShutdownStarted) return;
+httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`=================================================`);
     console.log(`👻 Ghost Cloud Relay Server is RUNNING on port ${PORT}`);
     console.log(`🔒 Secret Key: configured (${GHOST_SECRET.length} chars)`);
@@ -3558,6 +3625,7 @@ const httpServer = app.listen(PORT, '0.0.0.0', () => {
         fetch(`${SELF_URL}/api/health`, { signal: AbortSignal.timeout(10000) }).catch(() => {});
     }, 90 * 1000);
 });
+}).catch(error => scheduleFatalExit('Storage startup failed', error));
 
 let gracefulShutdownStarted = false;
 function gracefulShutdown(signal) {
@@ -3571,12 +3639,27 @@ function gracefulShutdown(signal) {
     for (const entry of accountSockets.values()) {
         try { if (entry && entry.socket) entry.socket.disconnect(); } catch (_) {}
     }
-    const finish = () => {
-        try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (_) {}
-        if (typeof process.exit === 'function') process.exit(0);
+    let finished = false;
+    let forceTimer;
+    const finish = async () => {
+        if (finished) return;
+        finished = true;
+        try {
+            await Promise.all(startupStorageTasks);
+            await storageTransactions.close();
+            if (runtimeStorage) await runtimeStorage.close();
+            if (forceTimer) clearTimeout(forceTimer);
+            try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (_) {}
+            if (typeof process.exit === 'function') process.exit(0);
+        } catch (error) {
+            console.error('[Storage] Shutdown drain failed:', error.message);
+            if (typeof process.exit === 'function') process.exit(1);
+        }
     };
     if (httpServer && typeof httpServer.close === 'function') {
-        const forceTimer = setTimeout(finish, 5000);
+        // Leave time for the active atomic commit before Render's termination
+        // deadline. Never report a clean shutdown if the drain did not finish.
+        forceTimer = setTimeout(() => { if (typeof process.exit === 'function') process.exit(1); }, 25000);
         if (forceTimer && typeof forceTimer.unref === 'function') forceTimer.unref();
         httpServer.close(finish);
     } else {

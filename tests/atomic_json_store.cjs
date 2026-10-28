@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { createStorageCodec } = require('../storage-codec');
-const { createAtomicJsonStore } = require('../atomic-json-store');
+const { createAtomicJsonStore } = require('../atomic-json-startup');
 const files = new Map(); let failRename = false, clock = 0;
 const fs = { existsSync: file => file === '/data' || files.has(file), mkdirSync() {},
     writeFileSync(file, data) { files.set(file, data); },

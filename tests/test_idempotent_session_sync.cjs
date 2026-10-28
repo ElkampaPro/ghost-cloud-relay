@@ -1,3 +1,4 @@
+(async () => {
 'use strict';
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -45,8 +46,9 @@ const c = {
     if (n === 'path') return path;
     if (n === 'fs') return { existsSync: () => false, mkdirSync() {}, writeFileSync() {}, renameSync() {}, unlinkSync() {} };
     if (n === 'socket.io-client') return { io() { return new FakeSocket(); } };
+    if (n === './atomic-json-startup') return require('../atomic-json-startup');
+    if (n === './atomic-json-store') return {createStorageTransactions:require('../atomic-json-store').createStorageTransactions,createAtomicJsonStore:()=>({write:async()=>true,close:async()=>{}})};
     if (n === './pm-metadata') return require('../pm-metadata');
-    if (n === './atomic-json-store') return require('../atomic-json-store');
     if (n === './storage-codec') return require('../storage-codec');
     if (n === './request-budget') return require('../request-budget');
     if (n === './cors-policy') return require('../cors-policy');
@@ -64,7 +66,7 @@ const c = {
 vm.createContext(c);
 vm.runInContext(src, c);
 
-function call(method, p, body = {}, query = {}, headers = {}) {
+async function call(method, p, body = {}, query = {}, headers = {}) {
   let status = 200, payload;
   const req = {
     body,
@@ -77,68 +79,76 @@ function call(method, p, body = {}, query = {}, headers = {}) {
   };
   const h = routes.get(method + ' ' + p);
   let i = 0;
-  const next = () => h[i++]?.(req, res, next);
-  next();
+  async function dispatch(index) {
+    if (!h[index]) return;
+    let downstream;
+    const result = h[index](req, res, () => { downstream = dispatch(index + 1); });
+    await result;
+    if (downstream) await downstream;
+  }
+  await dispatch(0);
   return { status, payload };
 }
 
 console.log('=== TEST 1: Initial Session Registration ===');
-const firstSync = call('POST', '/api/session', {
+const firstSync = (await call('POST', '/api/session', {
   cookies: 'user_id=100; PHPSESSID=session_alpha_123',
   utk: 'token_alpha',
   userId: '100',
   singleAccount: true
-});
+}));
 assert.equal(firstSync.status, 200);
 assert.equal(firstSync.payload.ok, true);
 assert.equal(firstSync.payload.changed, true, 'Initial sync must record change');
 const initialDisconnects = socketDisconnects;
 
 console.log('=== TEST 2: Repeated Identical Session Must Be Idempotent (changed: false) ===');
-const repeatSync = call('POST', '/api/session', {
+const repeatSync = (await call('POST', '/api/session', {
   cookies: 'user_id=100; PHPSESSID=session_alpha_123',
   utk: 'token_alpha',
   userId: '100',
   singleAccount: true
-});
+}));
 assert.equal(repeatSync.status, 200);
 assert.equal(repeatSync.payload.ok, true);
 assert.equal(repeatSync.payload.changed, false, 'Identical session resend must be idempotent (changed: false)');
 assert.equal(socketDisconnects, initialDisconnects, 'Socket must NOT disconnect on identical session resend');
 
 console.log('=== TEST 3: Shuffled Cookie Order Must Be Idempotent ===');
-const shuffledSync = call('POST', '/api/session', {
+const shuffledSync = (await call('POST', '/api/session', {
   cookies: 'PHPSESSID=session_alpha_123; user_id=100;',
   utk: 'token_alpha',
   userId: '100',
   singleAccount: true
-});
+}));
 assert.equal(shuffledSync.status, 200);
 assert.equal(shuffledSync.payload.ok, true);
 assert.equal(shuffledSync.payload.changed, false, 'Shuffled cookie order must be idempotent');
 assert.equal(socketDisconnects, initialDisconnects, 'Socket must NOT disconnect on shuffled cookie order');
 
 console.log('=== TEST 4: Transient Cookie Additions With Same Auth Identity Must Not Reconnect Socket ===');
-const transientSync = call('POST', '/api/session', {
+const transientSync = (await call('POST', '/api/session', {
   cookies: 'user_id=100; PHPSESSID=session_alpha_123; _cf_bm=new_transient_value; b_time=9999',
   utk: 'token_alpha',
   userId: '100',
   singleAccount: true
-});
+}));
 assert.equal(transientSync.status, 200);
 assert.equal(transientSync.payload.ok, true);
 assert.equal(transientSync.payload.changed, false, 'Transient cookie additions with identical PHPSESSID and UID must be idempotent');
 assert.equal(socketDisconnects, initialDisconnects, 'Socket must NOT disconnect when auth session is identical');
 
 console.log('=== TEST 5: Actual Credential Change (New PHPSESSID) Must Register Change ===');
-const authChangeSync = call('POST', '/api/session', {
+const authChangeSync = (await call('POST', '/api/session', {
   cookies: 'user_id=100; PHPSESSID=session_beta_456',
   utk: 'token_alpha',
   userId: '100',
   singleAccount: true
-});
+}));
 assert.equal(authChangeSync.status, 200);
 assert.equal(authChangeSync.payload.ok, true);
 assert.equal(authChangeSync.payload.changed, true, 'Different PHPSESSID must register change');
 
 console.log('=== ALL IDEMPOTENT SESSION SYNC TESTS PASSED! ===');
+
+})().catch(error=>{console.error(error);process.exitCode=1;});

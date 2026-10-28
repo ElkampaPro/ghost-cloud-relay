@@ -1,3 +1,4 @@
+(async () => {
 // Regression test suite for S01 (Concurrent Client Isolation) and S02 (UTK Rotation Persistence).
 // PASS means defects are properly FIXED and verified.
 const fs = require('node:fs');
@@ -26,8 +27,9 @@ const c = {Buffer,
     if (n === 'path') return path;
     if (n === 'fs') return { existsSync: () => false, mkdirSync() {}, writeFileSync() {}, renameSync() {}, unlinkSync() {} };
     if (n === 'socket.io-client') return { io() { return { on() {}, onAny() {}, removeAllListeners() {}, disconnect() {} }; } };
+    if (n === './atomic-json-startup') return require('../atomic-json-startup');
+    if (n === './atomic-json-store') return {createStorageTransactions:require('../atomic-json-store').createStorageTransactions,createAtomicJsonStore:()=>({write:async()=>true,close:async()=>{}})};
     if (n === './pm-metadata') return require('../pm-metadata');
-    if (n === './atomic-json-store') return require('../atomic-json-store');
     if (n === './storage-codec') return require('../storage-codec');
     if (n === './request-budget') return require('../request-budget');
     if (n === './cors-policy') return require('../cors-policy');
@@ -45,7 +47,7 @@ const c = {Buffer,
 vm.createContext(c);
 vm.runInContext(src, c);
 
-function call(method, p, body = {}, query = {}, headers = {}) {
+async function call(method, p, body = {}, query = {}, headers = {}) {
   let status = 200, payload;
   const req = {
     body,
@@ -58,45 +60,53 @@ function call(method, p, body = {}, query = {}, headers = {}) {
   };
   const h = routes.get(method + ' ' + p);
   let i = 0;
-  const next = () => h[i++]?.(req, res, next);
-  next();
+  async function dispatch(index) {
+    if (!h[index]) return;
+    let downstream;
+    const result = h[index](req, res, () => { downstream = dispatch(index + 1); });
+    await result;
+    if (downstream) await downstream;
+  }
+  await dispatch(0);
   return { status, payload };
 }
 
 
 const server=c;
-function session(token,cookie,userId='100'){return call('POST','/api/session',{cookies:'PHPSESSID='+cookie,utk:token,userId,singleAccount:true})}
+async function session(token,cookie,userId='100'){return (await call('POST','/api/session',{cookies:'PHPSESSID='+cookie,utk:token,userId,singleAccount:true}))}
 function headers(token,id='100'){return {'x-ghost-token':token,'x-ghost-user-id':id,'x-ghost-account-key':id}}
-assert.equal(session('first','cookie-a').status,200);
-assert.equal(call('POST','/api/messages/incoming',{peerId:'p',message:{id:'msg1',text:'fixture'}},{},headers('first')).status,200);
+assert.equal((await session('first','cookie-a')).status,200);
+assert.equal((await call('POST','/api/messages/incoming',{peerId:'p',message:{id:'msg1',text:'fixture'}},{},headers('first'))).status,200);
 let state=vm.runInContext('({keys:Object.keys(accountSessions).filter(k=>!accountSessions[k].revoked),sessionId:sessionData.userId})',server);
 assert.equal(state.keys.length,1,'Read requests cannot create a second account from PHP session');
 assert.equal(state.keys[0],'100');
 assert.equal(state.sessionId,'100','Explicit approved identity survives session persistence');
-assert.equal(session('second','cookie-b').status,200);
-call('POST','/api/messages/incoming',{peerId:'p',message:{id:'msg2',text:'fixture2'}},{},headers('second'));
-const a=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('first')).payload;
-const b=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second')).payload;
+assert.equal((await session('second','cookie-b')).status,200);
+(await call('POST','/api/messages/incoming',{peerId:'p',message:{id:'msg2',text:'fixture2'}},{},headers('second')));
+const a=(await call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('first'))).payload;
+const b=(await call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second'))).payload;
 assert.equal(a.messages.length,2);assert.equal(b.messages.length,2);
 assert.ok(b.current_seq>=Math.max(...b.messages.map(m=>m.seq)),'Counter must cover all retained message sequences');
 assert.equal(a.current_seq,b.current_seq);
 const beforePull = vm.runInContext('JSON.stringify({messages,deviceCursors})',server);
-assert.equal(call('GET','/api/sync',{}, {all:'true',mark:'true'},headers('second')).status,200);
+assert.equal((await call('GET','/api/sync',{}, {all:'true',mark:'true'},headers('second'))).status,200);
 assert.equal(vm.runInContext('JSON.stringify({messages,deviceCursors})',server),beforePull,'Legacy GET mark must never modify message or cursor state');
 for (const after_seq of ['1junk','-1','9007199254740992','', ['1']]) {
-    assert.equal(call('GET','/api/sync',{}, {after_seq},headers('second')).status,400,'Invalid cursor rejected');
+    assert.equal((await call('GET','/api/sync',{}, {after_seq},headers('second'))).status,400,'Invalid cursor rejected');
 }
-assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:'old-epoch'}, {},headers('second')).status,409);
+assert.equal((await call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:'old-epoch'}, {},headers('second'))).status,409);
 assert.equal(vm.runInContext('JSON.stringify({messages,deviceCursors})',server),beforePull,'Stale ACK must not advance new-epoch cursor');
-assert.equal(call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:b.epoch}, {},headers('second')).status,200);
+assert.equal((await call('POST','/api/sync/ack',{device_id:'test-device',ack_seq:1,epoch:b.epoch}, {},headers('second'))).status,200);
 // Presentation metadata survives cloud round trip without copying read flags.
-call('POST','/api/messages/incoming',{peerId:'p',message:{id:'quoted',text:'fixture',replyTo:'123',replyName:'A',replyPreview:'B',replyOwn:true,kind:'text',canReact:false,lrid:999,read:true}},{},headers('second'));
-const quote=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second')).payload.messages.find(m=>m.id==='quoted');
+(await call('POST','/api/messages/incoming',{peerId:'p',message:{id:'quoted',text:'fixture',replyTo:'123',replyName:'A',replyPreview:'B',replyOwn:true,kind:'text',canReact:false,lrid:999,read:true}},{},headers('second')));
+const quote=(await call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('second'))).payload.messages.find(m=>m.id==='quoted');
 assert.equal(quote.replyTo,'123');assert.equal(quote.replyPreview,'B');assert.equal(quote.canReact,false);assert.equal(quote.lrid,undefined);assert.equal(quote.read,undefined);
 // A legacy owner has evidence for the same identity; renewal migrates its sequence horizon.
 vm.runInContext(`accountSessions={'phpsess_legacy':{utk:'legacy',utks:['legacy'],cookies:'PHPSESSID=old',revoked:false}};sessionData={utk:'legacy',cookies:'PHPSESSID=old'};messages=[{owner:'phpsess_legacy',peerId:'p',id:'legacy-id',type:'received',timestamp:1,seq:90}];ownerSeqCounters={'phpsess_legacy':90};`,server);
-assert.equal(session('legacy','old').status,200);
+assert.equal((await session('legacy','old')).status,200);
 assert.equal(vm.runInContext('sessionData.accountKey',server),'100','Legacy enrollment upgrades identity even when cookies/token are unchanged');
-const migrated=call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('legacy')).payload;
+const migrated=(await call('GET','/api/sync',{}, {all:'true',after_seq:'0'},headers('legacy'))).payload;
 assert.equal(migrated.messages.length,1);assert.ok(migrated.current_seq>=90,'Migration must preserve the delivery sequence horizon');
 console.log('Stable cloud identity across device/session rotation and sequence migration passed');
+
+})().catch(error=>{console.error(error);process.exitCode=1;});
